@@ -104,6 +104,20 @@ def warmup_assets() -> dict:
     return {"ready": True, "message": "ok"}
 
 
+def patches_applied() -> bool:
+    """检查排版修复补丁是否已应用到已安装的 BabelDOC。"""
+    import babeldoc
+
+    marker_file = (
+        Path(babeldoc.__file__).parent
+        / "format/pdf/document_il/midend/paragraph_finder.py"
+    )
+    try:
+        return "_redistribute_orphan_fragments" in marker_file.read_text("utf-8")
+    except OSError:
+        return False
+
+
 def build_translator(profile: Profile, lang_in: str, lang_out: str):
     """按配置档的接口协议构建翻译器（openai | anthropic）。"""
     protocol = getattr(profile, "protocol", "openai") or "openai"
@@ -158,12 +172,6 @@ def build_translation_config(profile: Profile, opts: RunnerOptions) -> Translati
         glossaries=opts.glossaries or None,
         auto_extract_glossary=opts.auto_extract_glossary,
         custom_system_prompt=profile.custom_system_prompt or None,
-        # 排版实测调优（scripts/layout_experiments.py E4 组合）：
-        # 拆分窄行避免段落回填时行重叠；min_text_length=2 让 "The" 这类
-        # 被独立成段的短词也参与翻译，消除英文残留
-        split_short_lines=True,
-        short_line_split_factor=0.8,
-        min_text_length=2,
     )
     # CLI 同款调用：把字体映射器挂到模型上
     getattr(model, "init_font_mapper", lambda _c: None)(config)

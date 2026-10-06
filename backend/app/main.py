@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from app import config
 from app.api import assets, files, glossary, profiles, tasks
 from app.db import init_db
-from app.services.babeldoc_runner import ensure_init
+from app.services.babeldoc_runner import ensure_init, patches_applied
 from app.services.orchestrator import manager, recover_interrupted
 
 logging.basicConfig(level=logging.INFO,
@@ -26,6 +26,11 @@ async def lifespan(app: FastAPI):
     init_db()
     recover_interrupted()
     ensure_init()
+    if not patches_applied():
+        logging.getLogger(__name__).warning(
+            "BabelDOC 排版修复补丁未应用，翻译可能出现文字断裂/重叠。"
+            "请运行：uv run python ../scripts/apply_babeldoc_patches.py 后重启。"
+        )
     await manager.start()
     yield
 

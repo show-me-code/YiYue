@@ -25,12 +25,10 @@ def patch_config(cfg: TranslationConfig, **opts):
 
 
 EXPERIMENTS = {
-    "E1-baseline": {},
-    "E2-minlen1": {"min_text_length": 1},
-    "E3-splitshort": {"split_short_lines": True, "short_line_split_factor": 0.8},
-    "E4-splitshort-minlen1": {"split_short_lines": True,
-                              "short_line_split_factor": 0.8,
-                              "min_text_length": 1},
+    # 补丁后：上游 PR #617/#618 修复 + 默认排版选项
+    "E5a-patched-default": {"split_short_lines": False, "min_text_length": 5},
+    # 补丁后：沿用 E4 选项（应用当前默认）
+    "E5b-patched-E4": {},
 }
 
 

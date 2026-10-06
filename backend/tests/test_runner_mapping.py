@@ -34,10 +34,9 @@ def test_build_translation_config_mapping(stub_model, tmp_path):
     assert cfg.custom_system_prompt == "Be terse."
     assert cfg.watermark_output_mode.value == "no_watermark"
     assert cfg.output_dir == tmp_path / "out"
-    # 排版调优默认值（E4 组合，消除行重叠与短词英文残留）
-    assert cfg.split_short_lines is True
-    assert cfg.short_line_split_factor == 0.8
-    assert cfg.min_text_length == 2
+    # 排版选项保持引擎默认：段落修复由 babeldoc 补丁（scripts/apply_babeldoc_patches.py）承担
+    assert cfg.split_short_lines is False
+    assert cfg.min_text_length == 5
 
 
 def test_scan_mode_auto(stub_model, tmp_path):

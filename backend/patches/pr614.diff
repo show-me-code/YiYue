@@ -1,0 +1,12 @@
+diff --git a/babeldoc/format/pdf/document_il/midend/paragraph_finder.py b/babeldoc/format/pdf/document_il/midend/paragraph_finder.py
+index efeed5319..f729d3a26 100644
+--- a/babeldoc/format/pdf/document_il/midend/paragraph_finder.py
++++ b/babeldoc/format/pdf/document_il/midend/paragraph_finder.py
+@@ -606,7 +606,6 @@ def _get_effective_y_bounds(self, char: PdfCharacter) -> tuple[float, float]:
+         PDF bounding box. This helps use more accurate layout information when available.
+         """
+         visual_box = char.visual_bbox.box
+-        return visual_box.y, visual_box.y2
+         pdf_box = char.box
+         if calculate_iou_for_boxes(visual_box, pdf_box) >= 0.5:
+             return visual_box.y, visual_box.y2

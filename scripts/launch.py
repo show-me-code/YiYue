@@ -37,6 +37,18 @@ def ensure_frontend() -> None:
         sys.exit(f"前端构建失败（退出码 {e.returncode}）：请确认已安装 Node.js ≥ 18")
 
 
+def apply_babeldoc_patches() -> None:
+    """应用 BabelDOC 排版修复补丁（幂等，须在引擎导入前执行）。"""
+    script = ROOT / "scripts" / "apply_babeldoc_patches.py"
+    if not script.exists():
+        return
+    try:
+        subprocess.run([sys.executable, str(script)], cwd=ROOT / "backend",
+                       check=True, timeout=60)
+    except Exception as e:  # noqa: BLE001
+        print(f"警告：排版补丁应用失败（{e}），翻译质量可能受影响")
+
+
 def start_server() -> subprocess.Popen:
     print(f"启动服务 {URL} ...")
     return subprocess.Popen(
@@ -62,6 +74,7 @@ def main() -> None:
         return
 
     ensure_frontend()
+    apply_babeldoc_patches()
     proc = start_server()
     try:
         if not wait_ready():
