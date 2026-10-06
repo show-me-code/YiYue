@@ -169,9 +169,17 @@ class TaskManager:
 
         self._set_status(task_id, "translating", started_at=_now(), error=None)
         self._set_progress(
-            task_id, part_index=0, part_total=0, stage="准备中",
+            task_id, part_index=0, part_total=0, stage="检查翻译服务",
             stage_progress=0, overall_progress=0, pages_done=0,
         )
+
+        # 预检：一次真实调用确认翻译服务可用。
+        # 没有这一步，LLM 调不通时引擎会把每段静默回退成原文，
+        # 任务“完成”却输出未翻译的 PDF。
+        translator = babeldoc_runner.build_translator(
+            profile, task.lang_in, task.lang_out
+        )
+        await asyncio.to_thread(babeldoc_runner.preflight, translator)
 
         # 页码范围：先抽取所选页作为工作文件
         source = original

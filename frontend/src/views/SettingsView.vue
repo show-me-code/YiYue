@@ -8,9 +8,11 @@ const dialogVisible = ref(false)
 const editingId = ref<number | null>(null)
 const testing = ref<number | null>(null)
 const saving = ref(false)
+const suggest = ref<{ profile: Profile; protocol: 'openai' | 'anthropic'; detail: string } | null>(null)
 
 const form = reactive<ProfileInput>({
   name: '', base_url: '', api_key: '', model: 'gpt-4o-mini',
+  protocol: 'openai',
   qps: 4, pool_max_workers: null, custom_system_prompt: null, is_default: false,
 })
 
@@ -23,6 +25,7 @@ function openCreate() {
   editingId.value = null
   Object.assign(form, {
     name: '', base_url: '', api_key: '', model: 'gpt-4o-mini',
+    protocol: 'openai',
     qps: 4, pool_max_workers: null, custom_system_prompt: null, is_default: false,
   })
   dialogVisible.value = true
@@ -32,6 +35,7 @@ function openEdit(p: Profile) {
   editingId.value = p.id
   Object.assign(form, {
     name: p.name, base_url: p.base_url, api_key: '', model: p.model,
+    protocol: p.protocol ?? 'openai',
     qps: p.qps, pool_max_workers: p.pool_max_workers,
     custom_system_prompt: p.custom_system_prompt, is_default: p.is_default,
   })
@@ -55,13 +59,36 @@ async function save() {
 
 async function test(p: Profile) {
   testing.value = p.id
+  suggest.value = null
   try {
     const r = await api.testProfile(p.id)
     if (r.ok) ElMessage.success(r.detail)
-    else ElMessage.error(r.detail)
+    else if (r.suggest_protocol) {
+      suggest.value = { profile: p, protocol: r.suggest_protocol, detail: r.detail }
+    } else ElMessage.error(r.detail)
   } finally {
     testing.value = null
   }
+}
+
+/** 测试发现端点支持另一种协议时，一键切换并重测 */
+async function switchProtocol() {
+  if (!suggest.value) return
+  const { profile, protocol } = suggest.value
+  suggest.value = null
+  const current = profiles.value.find(x => x.id === profile.id)
+  if (!current) return
+  await api.updateProfile(profile.id, {
+    name: current.name, base_url: current.base_url, api_key: '',
+    model: current.model, protocol,
+    qps: current.qps, pool_max_workers: current.pool_max_workers,
+    custom_system_prompt: current.custom_system_prompt,
+    is_default: current.is_default,
+  })
+  await refresh()
+  ElMessage.success(`已切换为 ${protocol === 'anthropic' ? 'Anthropic 兼容' : 'OpenAI 兼容'} 协议`)
+  const updated = profiles.value.find(x => x.id === profile.id)
+  if (updated) test(updated)
 }
 
 async function remove(p: Profile) {
@@ -87,6 +114,7 @@ async function remove(p: Profile) {
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <b>{{ p.name }}</b>
         <el-tag v-if="p.is_default" size="small">默认</el-tag>
+        <el-tag size="small" type="info">{{ p.protocol === 'anthropic' ? 'Anthropic 协议' : 'OpenAI 协议' }}</el-tag>
         <span class="muted">{{ p.model }}</span>
         <span class="muted">{{ p.base_url || '官方 OpenAI 端点' }}</span>
         <span class="muted">{{ p.api_key_masked || '无密钥' }}</span>
@@ -98,6 +126,12 @@ async function remove(p: Profile) {
       </div>
     </div>
     <div v-if="!profiles.length" class="card muted">还没有配置档，点击右上角「新增配置」开始。</div>
+
+    <el-alert v-if="suggest" type="warning" :closable="false" style="margin-bottom:16px">
+      <p style="margin:0 0 6px">{{ suggest.detail }}</p>
+      <el-button size="small" type="warning"
+        @click="switchProtocol">切换为 {{ suggest.protocol === 'anthropic' ? 'Anthropic 兼容' : 'OpenAI 兼容' }} 协议</el-button>
+    </el-alert>
 
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑配置' : '新增配置'" width="560">
       <el-form label-width="130px">
@@ -113,6 +147,13 @@ async function remove(p: Profile) {
         </el-form-item>
         <el-form-item label="模型名">
           <el-input v-model="form.model" placeholder="如 deepseek-chat / gpt-4o-mini / glm-4-flash" />
+        </el-form-item>
+        <el-form-item label="接口协议">
+          <el-radio-group v-model="form.protocol">
+            <el-radio-button value="openai">OpenAI 兼容</el-radio-button>
+            <el-radio-button value="anthropic">Anthropic 兼容</el-radio-button>
+          </el-radio-group>
+          <div class="muted">不确定就用默认；「测试连接」检测到端点是其它协议时会提示一键切换</div>
         </el-form-item>
         <el-form-item label="QPS 限制">
           <el-input-number v-model="form.qps" :min="1" :max="100" />

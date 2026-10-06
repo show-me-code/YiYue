@@ -5,6 +5,7 @@ export interface Profile {
   name: string
   base_url: string
   model: string
+  protocol: 'openai' | 'anthropic'
   qps: number
   pool_max_workers: number | null
   custom_system_prompt: string | null
@@ -17,10 +18,18 @@ export interface ProfileInput {
   base_url: string
   api_key: string
   model: string
+  protocol: 'openai' | 'anthropic'
   qps: number
   pool_max_workers: number | null
   custom_system_prompt: string | null
   is_default: boolean
+}
+
+export interface ProfileTestResult {
+  ok: boolean
+  detail: string
+  protocol: string
+  suggest_protocol?: 'openai' | 'anthropic'
 }
 
 export interface GlossaryEntry {
@@ -104,7 +113,7 @@ export const api = {
     fetch(`/api/profiles/${id}`, { method: 'DELETE' }).then(r => handle<{ ok: boolean }>(r)),
   testProfile: (id: number) =>
     fetch(`/api/profiles/${id}/test`, { method: 'POST' })
-      .then(r => handle<{ ok: boolean; detail: string }>(r)),
+      .then(r => handle<ProfileTestResult>(r)),
 
   // 术语表
   listGlossary: () => fetch('/api/glossary').then(r => handle<GlossaryEntry[]>(r)),

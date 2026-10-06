@@ -19,7 +19,9 @@ def _mask(key: str) -> str:
 
 def _out(p: Profile) -> ProfileOut:
     return ProfileOut(
-        id=p.id, name=p.name, base_url=p.base_url, model=p.model, qps=p.qps,
+        id=p.id, name=p.name, base_url=p.base_url, model=p.model,
+        protocol=getattr(p, "protocol", "openai") or "openai",
+        qps=p.qps,
         pool_max_workers=p.pool_max_workers,
         custom_system_prompt=p.custom_system_prompt, is_default=p.is_default,
         api_key_masked=_mask(p.api_key),
@@ -82,30 +84,54 @@ def delete_profile(profile_id: int, s: Session = Depends(get_session)):
     return {"ok": True}
 
 
+def _probe(profile: Profile, protocol: str) -> tuple[bool, str]:
+    """按指定协议探测端点连通性。"""
+    base = profile.base_url.rstrip("/") if profile.base_url else None
+    if protocol == "anthropic":
+        url = (base or "https://api.anthropic.com") + "/v1/messages"
+        headers = {"x-api-key": profile.api_key,
+                   "anthropic-version": "2023-06-01"}
+        body: dict = {"model": profile.model, "max_tokens": 8,
+                      "messages": [{"role": "user", "content": "ping"}]}
+    else:
+        url = (base or "https://api.openai.com/v1") + "/chat/completions"
+        headers = {"Authorization": f"Bearer {profile.api_key}"} \
+            if profile.api_key else {}
+        body = {"model": profile.model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1}
+    try:
+        resp = httpx.post(url, headers=headers, json=body, timeout=20)
+        if resp.status_code == 200:
+            return True, "连接成功"
+        if "json" in resp.headers.get("content-type", ""):
+            try:
+                detail = resp.json().get("error", {}).get("message",
+                                                         resp.text[:200])
+            except Exception:  # noqa: BLE001
+                detail = resp.text[:200]
+        else:
+            detail = f"HTTP {resp.status_code}"
+        return False, f"HTTP {resp.status_code}: {detail}"
+    except httpx.HTTPError as e:
+        return False, f"连接失败：{e}"
+
+
 @router.post("/{profile_id}/test")
 def test_profile(profile_id: int, s: Session = Depends(get_session)):
     p = s.get(Profile, profile_id)
     if not p:
         raise HTTPException(404, "配置档不存在")
-    url = (p.base_url.rstrip("/") if p.base_url
-           else "https://api.openai.com/v1") + "/chat/completions"
-    try:
-        resp = httpx.post(
-            url,
-            headers={"Authorization": f"Bearer {p.api_key}"} if p.api_key else {},
-            json={
-                "model": p.model,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return {"ok": True, "detail": "连接成功"}
-        if "json" in resp.headers.get("content-type", ""):
-            detail = resp.json().get("error", {}).get("message", resp.text[:200])
-        else:
-            detail = resp.text[:200]
-        return {"ok": False, "detail": f"HTTP {resp.status_code}: {detail}"}
-    except httpx.HTTPError as e:
-        return {"ok": False, "detail": f"连接失败：{e}"}
+    protocol = getattr(p, "protocol", "openai") or "openai"
+    ok, detail = _probe(p, protocol)
+    result: dict = {"ok": ok, "detail": detail, "protocol": protocol}
+    if not ok:
+        other = "anthropic" if protocol == "openai" else "openai"
+        other_ok, other_detail = _probe(p, other)
+        if other_ok:
+            result["suggest_protocol"] = other
+            result["detail"] = (
+                f"当前协议（{protocol}）探测失败：{detail}；"
+                f"但该端点支持 {other} 协议，可一键切换。"
+            )
+    return result

@@ -15,6 +15,21 @@ def init_db() -> None:
     import app.models  # noqa: F401 确保表定义已注册
 
     SQLModel.metadata.create_all(engine)
+    _migrate()
+
+
+def _migrate() -> None:
+    """轻量迁移：为旧库补充新增列（SQLModel create_all 不会改已有表）。"""
+    import sqlalchemy
+
+    insp = sqlalchemy.inspect(engine)
+    cols = {c["name"] for c in insp.get_columns("profile")}
+    if "protocol" not in cols:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE profile ADD COLUMN protocol VARCHAR "
+                "DEFAULT 'openai' NOT NULL"
+            )
 
 
 def get_session():

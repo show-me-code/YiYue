@@ -8,6 +8,7 @@ class ProfileIn(BaseModel):
     base_url: str = ""
     api_key: str = ""
     model: str
+    protocol: str = "openai"  # openai | anthropic
     qps: int = 4
     pool_max_workers: int | None = None
     custom_system_prompt: str | None = None
@@ -19,6 +20,7 @@ class ProfileOut(BaseModel):
     name: str
     base_url: str
     model: str
+    protocol: str
     qps: int
     pool_max_workers: int | None
     custom_system_prompt: str | None

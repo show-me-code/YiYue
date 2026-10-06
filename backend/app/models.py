@@ -10,13 +10,14 @@ def utcnow() -> datetime:
 
 
 class Profile(SQLModel, table=True):
-    """OpenAI 兼容 API 配置档。"""
+    """LLM API 配置档。"""
 
     id: int | None = Field(default=None, primary_key=True)
     name: str
     base_url: str = ""  # 留空则用 openai 官方默认
     api_key: str = ""
     model: str
+    protocol: str = "openai"  # openai | anthropic
     qps: int = 4
     pool_max_workers: int | None = None
     custom_system_prompt: str | None = None

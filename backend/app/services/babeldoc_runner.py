@@ -28,12 +28,17 @@ from babeldoc.glossary import Glossary
 from babeldoc.translator.translator import OpenAITranslator
 
 from app.models import Profile
+from app.services.anthropic_translator import AnthropicTranslator
 
 logger = logging.getLogger(__name__)
 
 
 class BabelDOCError(RuntimeError):
     pass
+
+
+class PreflightError(BabelDOCError):
+    """任务开始前的翻译服务连通性检查失败。"""
 
 
 @dataclass
@@ -99,15 +104,40 @@ def warmup_assets() -> dict:
     return {"ready": True, "message": "ok"}
 
 
-def build_translation_config(profile: Profile, opts: RunnerOptions) -> TranslationConfig:
-    translator = OpenAITranslator(
-        lang_in=opts.lang_in,
-        lang_out=opts.lang_out,
+def build_translator(profile: Profile, lang_in: str, lang_out: str):
+    """按配置档的接口协议构建翻译器（openai | anthropic）。"""
+    protocol = getattr(profile, "protocol", "openai") or "openai"
+    if protocol == "anthropic":
+        return AnthropicTranslator(
+            lang_in=lang_in, lang_out=lang_out, model=profile.model,
+            base_url=profile.base_url or None,
+            api_key=profile.api_key or "EMPTY",
+        )
+    return OpenAITranslator(
+        lang_in=lang_in,
+        lang_out=lang_out,
         model=profile.model,
         base_url=profile.base_url or None,
         # 本地推理服务（Ollama/LM Studio 等）通常不校验 key，占位即可
         api_key=profile.api_key or "EMPTY",
     )
+
+
+def preflight(translator) -> None:
+    """任务开始前用一次真实调用验证翻译服务连通性（结果会进缓存，开销极小）。"""
+    try:
+        out = translator.translate("The quick brown fox jumps over the lazy dog.")
+        if not out or not out.strip():
+            raise RuntimeError("翻译服务返回了空结果")
+    except Exception as e:  # noqa: BLE001
+        raise PreflightError(
+            f"翻译服务连通性检查失败：{e}。请到「API 配置」页测试连接、"
+            "核对 Base URL / 协议 / 模型名。"
+        ) from e
+
+
+def build_translation_config(profile: Profile, opts: RunnerOptions) -> TranslationConfig:
+    translator = build_translator(profile, opts.lang_in, opts.lang_out)
     model = get_layout_model()
     config = TranslationConfig(
         translator=translator,
