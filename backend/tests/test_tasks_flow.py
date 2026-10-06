@@ -49,6 +49,9 @@ def test_full_flow_with_parts(client, profile, tmp_path):
     assert head.status_code == 206
     assert head.headers["Content-Range"].startswith("bytes 0-99/")
     assert len(head.content) == 100
+    # 同一 URL 下的 PDF 会被重跑替换，必须禁用缓存，否则浏览器一直显示旧译文
+    assert "no-store" in head.headers["Cache-Control"]
+    assert "no-store" in client.get(mono_url).headers["Cache-Control"]
 
 
 def test_cache_hit_on_same_options(client, profile, tmp_path):

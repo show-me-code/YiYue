@@ -45,6 +45,9 @@ def get_file(task_id: int, kind: str, range: str | None = None,
     common_headers = {
         "Accept-Ranges": "bytes",
         "Content-Disposition": f'inline; filename="{filename}"',
+        # 同一个 URL 下的 PDF 会被"重试/重跑"整体替换，浏览器与 pdf.js 一旦
+        # 按启发式缓存就会一直显示旧文件（实测刷新后仍是旧译文）。
+        "Cache-Control": "no-store",
     }
 
     if range:
