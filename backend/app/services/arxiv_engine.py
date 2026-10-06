@@ -10,10 +10,17 @@ from pathlib import Path
 import httpx
 import pymupdf
 
+from app import config
+
 logger = logging.getLogger(__name__)
 
 EPRINT_URL = "https://arxiv.org/e-print/{id}"
 _UA = {"User-Agent": "yiyue/0.1 (local academic translation tool)"}
+# 实测本机到 arXiv 的 e-print 下载可能耗时 2~3 分钟（4MB 源码包），
+# 超时设短会让任务静默回退到 BabelDOC 排版——所以给足时间。
+DOWNLOAD_TIMEOUT_S = 600.0
+# 源码本地缓存：同一篇论文重复翻译时不再走网络（迭代调试时尤其重要）
+CACHE_DIR = config.DATA_DIR / "arxiv-cache"
 
 
 class ArxivEngineError(RuntimeError):
@@ -60,7 +67,8 @@ def download_pdf(arxiv_id: str) -> bytes:
     last_err: Exception | None = None
     for attempt in range(3):
         try:
-            with httpx.Client(timeout=180, follow_redirects=True) as client:
+            with httpx.Client(timeout=DOWNLOAD_TIMEOUT_S,
+                              follow_redirects=True) as client:
                 r = client.get(url, headers=_UA)
                 r.raise_for_status()
             if not r.content.startswith(b"%PDF"):
@@ -75,21 +83,47 @@ def download_pdf(arxiv_id: str) -> bytes:
     raise ArxivEngineError(f"arXiv PDF 下载失败：{last_err}")
 
 
-def download_source(arxiv_id: str, dest_dir: Path) -> Path:
-    """下载 e-print 源码包到 dest_dir，返回本地文件路径。"""
+def cached_source_path(arxiv_id: str) -> Path:
+    """源码缓存的存放路径（按 ID 规整文件名）。"""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", arxiv_id)
+    return CACHE_DIR / safe / "source.bin"
+
+
+def download_source(arxiv_id: str, dest_dir: Path, use_cache: bool = True) -> Path:
+    """下载 e-print 源码包到 dest_dir，返回本地文件路径。
+
+    优先用本地缓存（同一篇论文重跑不必再等几分钟，也不受 arXiv 限流影响）；
+    命中缓存时仍然照常落一份到任务目录，保持任务自包含。
+    """
+    dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
+    path = dest_dir / "source.bin"
+
+    cached = cached_source_path(arxiv_id)
+    if use_cache and cached.exists() and cached.stat().st_size > 1024:
+        shutil.copy(cached, path)
+        logger.info("arXiv 源码命中本地缓存：%s（%d 字节）",
+                    arxiv_id, cached.stat().st_size)
+        return path
+
     url = EPRINT_URL.format(id=arxiv_id)
     last_err: Exception | None = None
     for attempt in range(3):
         try:
-            with httpx.Client(timeout=120, follow_redirects=True) as client:
+            with httpx.Client(timeout=DOWNLOAD_TIMEOUT_S,
+                              follow_redirects=True) as client:
                 r = client.get(url, headers=_UA)
                 r.raise_for_status()
             raw = r.content
             if raw[:2] == b"%P":  # arXiv 返回的是 PDF：说明无源码
                 raise ArxivEngineError("该论文在 arXiv 上没有 LaTeX 源码（仅 PDF）")
-            path = dest_dir / "source.bin"
             path.write_bytes(raw)
+            try:
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(path, cached)
+                logger.info("arXiv 源码已缓存：%s → %s", arxiv_id, cached)
+            except OSError:  # 缓存失败不影响本次任务
+                logger.warning("写入源码缓存失败（忽略）：%s", cached, exc_info=True)
             return path
         except ArxivEngineError:
             raise

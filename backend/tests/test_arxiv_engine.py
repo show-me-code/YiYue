@@ -196,6 +196,27 @@ def test_use_shipped_bbl_without_bbl(tmp_path):
     assert "\\bibliography{x}" in main.read_text("utf-8")
 
 
+def test_download_source_uses_local_cache(tmp_path, monkeypatch):
+    """命中本地源码缓存时不应再走网络（本机到 arXiv 一次要 2~3 分钟）。"""
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(arxiv_engine, "CACHE_DIR", cache_root)
+    cached = arxiv_engine.cached_source_path("1610.01644")
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(b"x" * 4096)
+
+    def _no_network(*a, **k):  # pragma: no cover - 命中缓存就不该被调用
+        raise AssertionError("缓存命中却发起了网络请求")
+
+    monkeypatch.setattr(arxiv_engine.httpx, "Client", _no_network)
+    dest = tmp_path / "task"
+    got = arxiv_engine.download_source("1610.01644", dest)
+    assert got == dest / "source.bin"
+    assert got.stat().st_size == 4096  # 任务目录里照常落一份，保持自包含
+    # ID 里的斜杠等字符要规整成合法文件名
+    assert arxiv_engine.cached_source_path("cs/0112017").name == "source.bin"
+    assert "/" not in arxiv_engine.cached_source_path("cs/0112017").parent.name
+
+
 # ---- 图注抽取：captionof / subcaption / 嵌套花括号 / 子图注补译 ----
 
 def test_extract_captionof_and_nested_braces():

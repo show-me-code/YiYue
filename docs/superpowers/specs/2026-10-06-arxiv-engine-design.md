@@ -59,6 +59,10 @@ arxiv 引擎（services/arxiv_engine.py）:
 
 ## 缓存与幂等
 
+- **arXiv 源码本地缓存**：`data/arxiv-cache/<id>/source.bin`。实测本机到 arXiv 的
+  e-print 下载要 45~145 秒，超时设短会让任务**静默回退到 BabelDOC 排版**（看起来
+  "完成"了，但走的不是源码直译路线）。因此下载超时放宽到 600s，并且同一篇论文重复
+  翻译时直接吃本地缓存（命中后照常往任务目录落一份，保持任务自包含）。
 - 任务级缓存键加入 `cache.PIPELINE_VERSION`：改动预处理/提示词/宏包注入等影响产出的逻辑时
   递增，旧产出不再被命中——否则会出现"代码修好了、跑出来还是旧结果"。
 - 翻译器层缓存键由 BabelDOC 依 model + system prompt 等构成，提示词变更即自然失效。
