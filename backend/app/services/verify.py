@@ -133,6 +133,45 @@ def overflow_pt(ink: pymupdf.Rect, area: pymupdf.Rect) -> float:
                area.y0 - ink.y0, ink.y1 - area.y1)
 
 
+def spacing_profile(doc: pymupdf.Document) -> dict:
+    """行距画像：段内行距众数与一致性、段间基线距离。
+
+    用基线（baseline）而不是墨迹外接框，才能区分"排版行距"与"字形上下伸展"。
+    """
+    from collections import Counter
+
+    gaps: list[float] = []
+    across: Counter = Counter()
+    for pi in range(len(doc)):
+        prev_last = None
+        for block in doc[pi].get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            bases = [round(line["spans"][0]["origin"][1], 1)
+                     for line in block["lines"] if line.get("spans")]
+            if not bases:
+                continue
+            for a, b in zip(bases, bases[1:]):
+                g = round(b - a, 1)
+                if 4 < g < 40:          # 同一文本块内的行距
+                    gaps.append(g)
+            if prev_last is not None:
+                g = round(bases[0] - prev_last, 1)
+                if 12 < g < 26:         # 段间/标题后的基线距离
+                    across[g] += 1
+            prev_last = bases[-1]
+    if not gaps:
+        return {}
+    mode, hit = Counter(gaps).most_common(1)[0]
+    same = sum(1 for g in gaps if abs(g - mode) <= 0.3)
+    return {
+        "body_leading_pt": mode,
+        "leading_uniformity": round(100 * same / len(gaps), 1),
+        "paragraph_pitch_pt": across.most_common(1)[0][0] if across else None,
+        "samples": len(gaps),
+    }
+
+
 def log_stats(log_path: Path | None) -> dict:
     """编译日志里的排版告警计数（Overfull/Underfull/未定义引用与文献）。"""
     if not log_path or not Path(log_path).exists():
@@ -245,6 +284,18 @@ def verify_translation(
         "english_captions": len(zh_captions),
         "english_caption_sample": zh_captions[0] if zh_captions else None,
     }
+    spacing_t = spacing_profile(doc_t)
+    spacing_b = spacing_profile(doc_b)
+    content["spacing"] = spacing_t
+    if content.get("spacing"):
+        uni_t = spacing_t["leading_uniformity"]
+        uni_b = spacing_b.get("leading_uniformity") if spacing_b else None
+        # 行距"不统一"的判定与具体行距值无关：只看一致性是否明显差于基线（或绝对偏低）
+        if (uni_b is not None and uni_t + 5 < uni_b) or uni_t < 70:
+            content["spacing_warning"] = (
+                f"段内行距一致性仅 {uni_t}%"
+                + (f"（基线 {uni_b}%）" if uni_b is not None else "")
+                + "，行距不统一")
     stats_t, stats_b = log_stats(translated_log), log_stats(baseline_log)
     overfull_new = max(0, stats_t.get("overfull_hbox", 0) - stats_b.get("overfull_hbox", 0))
     issues = dict(issues or {})
@@ -282,6 +333,8 @@ def verify_translation(
         reasons.append(
             f"{content['english_captions']} 条图表标题仍是英文："
             f"「{(content['english_caption_sample'] or '')[:60]}…」")
+    if content.get("spacing_warning"):
+        reasons.append(content["spacing_warning"])
     if issues.get("chunks_untranslated"):
         reasons.append(f"{issues['chunks_untranslated']} 个正文块未翻译（已保留英文）")
     if issues.get("captions_untranslated"):
@@ -325,6 +378,7 @@ def verify_translation(
             "note": "与基线相同的 Overfull 属作者原版瑕疵，按忠实原则保留",
         },
         "translation_issues": issues,
+        "baseline_content": {"spacing": spacing_b},
         "verdict": "需人工复核" if reasons else "通过",
         "reasons": reasons,
         "notes": notes,
@@ -364,6 +418,7 @@ def summary_text(report: dict) -> str:
         else:
             lines.append(f"  p{p['page']:>3}: {p.get('note', '')}")
     c = report["content"]
+    baseline_spacing = report.get("baseline_content", {}).get("spacing", {})
     lines += [
         "",
         f"内容完整性：图表标题 {c['captions_translated']}/{c['captions_baseline']}，"
@@ -371,6 +426,11 @@ def summary_text(report: dict) -> str:
         f"参考文献标题 {'有' if c['references_heading'] else '无'}，"
         f"成句英文残留 {c.get('english_lines', 0)} 行，"
         f"英文图表标题 {c.get('english_captions', 0)} 条",
+        f"行距：段内 {c.get('spacing', {}).get('body_leading_pt', '?')}pt"
+        f"（一致性 {c.get('spacing', {}).get('leading_uniformity', '?')}%），"
+        f"段间基线 {c.get('spacing', {}).get('paragraph_pitch_pt', '?')}pt"
+        f"（基线文档：段内 {baseline_spacing.get('body_leading_pt', '?')}pt"
+        f" 一致性 {baseline_spacing.get('leading_uniformity', '?')}%）",
         f"超版心页：译文 {report['overflow']['translated_pages']} / "
         f"基线 {report['overflow']['baseline_pages']}（新增 {report['overflow']['new_pages']}）",
         f"排版告警：译文 {report['layout_warnings']['translated']}",

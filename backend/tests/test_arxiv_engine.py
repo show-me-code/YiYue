@@ -490,6 +490,45 @@ def test_verify_flags_english_caption_in_rendered_pdf(tmp_path):
     assert any("图表标题仍是英文" in r for r in report["reasons"])
 
 
+def test_verify_reports_spacing_profile(tmp_path):
+    """行距画像：段内行距众数与一致性要进报告，才能客观判断"行距不统一"。"""
+    from app.services import verify
+
+    base = tmp_path / "b.pdf"
+    zh = tmp_path / "z.pdf"
+    rows = [(1, 72, y, f"Line {i} with some words here") for i, y in
+            enumerate(range(100, 100 + 12 * 8, 12), start=1)]
+    _make_pdf(base, rows + [(1, 72, 700, "References")])
+    _make_pdf(zh, rows + [(1, 72, 700, "References")])
+    report = verify.verify_translation(zh, base, tmp_path / "verify")
+    sp = report["content"]["spacing"]
+    assert sp["body_leading_pt"] == 12.0        # 构造的固定行距
+    assert sp["leading_uniformity"] == 100.0    # 完全一致
+    assert sp["samples"] >= 6
+    # 报告里给出行距数字，便于人对照
+    assert "行距" in (tmp_path / "verify" / "verify_summary.txt").read_text("utf-8")
+
+
+def test_verify_flags_inconsistent_leading(tmp_path):
+    """段内行距被打乱时（占比明显低于基线）要判为需人工复核。"""
+    from app.services import verify
+
+    base = tmp_path / "b.pdf"
+    zh = tmp_path / "z.pdf"
+    even = [(1, 72, 100 + 12 * i, f"Baseline line {i} text") for i in range(8)]
+    _make_pdf(base, even + [(1, 72, 700, "References")])
+    # 译文：把其中几行挪位，制造忽宽忽窄
+    messy = []
+    y = 100
+    for i in range(8):
+        messy.append((1, 72, y, f"Translated line {i} text"))
+        y += 16 if i % 2 else 9
+    _make_pdf(zh, messy + [(1, 72, 700, "References")])
+    report = verify.verify_translation(zh, base, tmp_path / "verify")
+    assert report["content"]["spacing"]["leading_uniformity"] < 100
+    assert any("行距" in r for r in report["reasons"])
+
+
 def test_cache_key_changes_with_pipeline_version():
     from app.services import cache
 
