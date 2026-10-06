@@ -46,3 +46,4 @@ class TaskOptionsIn(BaseModel):
     use_glossary: bool = True
     engine: str = "auto"  # auto|arxiv|babeldoc
     arxiv_id: str | None = None
+    line_spread: float = 1.3  # 行距倍数（1.0=跟原文一致；中文排版惯例约 1.3）

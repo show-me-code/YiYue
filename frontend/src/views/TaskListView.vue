@@ -24,6 +24,7 @@ const form = reactive<UploadOptions>({
   use_glossary: true,
   engine: 'auto',
   arxiv_id: '',
+  line_spread: 1.3,
 })
 
 const STATUS_META: Record<Task['status'], { label: string; type: 'info' | 'primary' | 'warning' | 'success' | 'danger' }> = {
@@ -185,6 +186,21 @@ function progressPct(t: Task): number {
                 <el-option label="扫描件覆盖（实验）" value="workaround" />
                 <el-option label="自动检测（实验）" value="auto" />
               </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row :gutter="12">
+          <el-col :span="8">
+            <el-form-item label="行距">
+              <el-select v-model="form.line_spread" style="width:100%">
+                <el-option label="1.3 × 中文惯例（默认）" :value="1.3" />
+                <el-option label="1.5 × 宽松" :value="1.5" />
+                <el-option label="1.15 × 紧凑" :value="1.15" />
+                <el-option label="1.0 × 跟原文一致" :value="1.0" />
+              </el-select>
+              <div class="muted">
+                仅 arXiv 直译生效；中文同字号比英文占位大，沿用原文行距会偏挤
+              </div>
             </el-form-item>
           </el-col>
         </el-row>

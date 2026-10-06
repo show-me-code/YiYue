@@ -155,6 +155,24 @@ def test_patch_style_files_handles_textbf_and_braces(tmp_path):
     assert out.count("摘要") == 2 and "Abstract" not in out
 
 
+def test_prepare_for_xetex_scales_line_spread():
+    """行距必须可调：1.0 跟原文一致，1.3 是中文惯例；且不能被文档自身的设置抹掉。"""
+    tex = ("\\documentclass{article}\n"
+           "\\begin{document}\nbody\n\\end{document}\n")
+    plain = tex_translate.prepare_for_xetex(tex, "zh", 1.0)
+    assert "\\dimexpr\\yiyuekeptstretch\\p@ * 1 / 1\\relax" in plain
+    loose = tex_translate.prepare_for_xetex(tex, "zh", 1.3)
+    assert "\\dimexpr\\yiyuekeptstretch\\p@ * 13 / 10\\relax" in loose
+    assert "\\linespread{\\yiyuespread}\\selectfont" in loose
+    # 不能用 \fpeval：Tectonic 自带的 LaTeX2e 2021 没有它（会导致整条路线编译失败）
+    assert "fpeval" not in loose
+    # 越界值被夹到 [1.0, 2.0]
+    assert "* 2 / 1\\relax" in tex_translate.prepare_for_xetex(tex, "zh", 9)
+    assert "* 1 / 1\\relax" in tex_translate.prepare_for_xetex(tex, "zh", 0.2)
+    # 非中文不注入
+    assert "ctex" not in tex_translate.prepare_for_xetex(tex, "en", 1.3)
+
+
 def test_prepare_for_xetex_restores_linespread_and_localizes_last():
     tex = ("\\documentclass{article}\n"
            "\\renewcommand{\\figurename}[0]{Figure~}\n"
@@ -162,9 +180,9 @@ def test_prepare_for_xetex_restores_linespread_and_localizes_last():
     out = tex_translate.prepare_for_xetex(tex, "zh")
     # ctex 用 Fandol 字体集
     assert "\\usepackage[fontset=fandol]{ctex}" in out
-    # ctex 会放大行距，必须记录并还原（否则页数会变）
+    # ctex 会放大行距，必须由我们按选项控制（而不是被 ctex 或文档设置牵着走）
     assert "\\edef\\yiyuekeptstretch{\\baselinestretch}" in out
-    assert "\\linespread{\\yiyuekeptstretch}\\selectfont" in out
+    assert "\\linespread{\\yiyuespread}\\selectfont" in out
     # 汉化块必须晚于作者自己的 \renewcommand{\figurename}，否则汉化被覆盖回英文
     assert out.index("\\renewcommand\\figurename{图}") > out.index("\\renewcommand{\\figurename}[0]{Figure~}")
     assert out.index("\\renewcommand\\figurename{图}") < out.index("\\begin{document}")
@@ -533,10 +551,13 @@ def test_cache_key_changes_with_pipeline_version():
     from app.services import cache
 
     base = {"lang_out": "zh", "engine": "arxiv",
-            "pipeline_version": cache.PIPELINE_VERSION}
+            "pipeline_version": cache.PIPELINE_VERSION, "line_spread": 1.3}
     old = dict(base, pipeline_version="0")
     assert (cache.compute_cache_key("abc", base)
             != cache.compute_cache_key("abc", old))
+    # 行距也是产出的一部分：改了行距不能命中旧产出
+    assert (cache.compute_cache_key("abc", base)
+            != cache.compute_cache_key("abc", dict(base, line_spread=1.0)))
 
 
 def test_section_count_tolerates_wrapped_headings():

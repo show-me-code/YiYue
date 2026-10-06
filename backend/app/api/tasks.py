@@ -59,6 +59,7 @@ def _task_json(task: Task, outputs: list[TaskOutput] | None = None) -> dict:
         "scan_mode": task.scan_mode,
         "engine": getattr(task, "engine", "auto"),
         "engine_used": getattr(task, "engine_used", None),
+        "line_spread": getattr(task, "line_spread", 1.3),
         "arxiv_id": getattr(task, "arxiv_id", None),
         "auto_extract_glossary": task.auto_extract_glossary,
         "cache_hit": task.cache_key is not None and task.status == "done"
@@ -98,6 +99,7 @@ async def create_task(
     use_glossary: bool = Form(True),
     engine: str = Form("auto"),
     arxiv_id: str = Form(""),
+    line_spread: float = Form(1.3),
     s: Session = Depends(get_session),
 ):
     opts = TaskOptionsIn(
@@ -105,11 +107,14 @@ async def create_task(
         pages=pages or None, part_size=part_size, scan_mode=scan_mode,
         auto_extract_glossary=auto_extract_glossary, use_glossary=use_glossary,
         engine=engine or "auto", arxiv_id=arxiv_id or None,
+        line_spread=line_spread,
     )
     if opts.scan_mode not in ("off", "workaround", "auto"):
         raise HTTPException(400, "scan_mode 无效")
     if opts.engine not in ("auto", "arxiv", "babeldoc"):
         raise HTTPException(400, "engine 无效")
+    if not 1.0 <= opts.line_spread <= 2.0:
+        raise HTTPException(400, "行距倍数需在 1.0 ~ 2.0 之间")
     if not s.get(Profile, opts.profile_id):
         raise HTTPException(400, "配置档不存在")
 
@@ -175,6 +180,7 @@ async def create_task(
                               and resolved_arxiv_id) else "babeldoc",
         "arxiv_id": resolved_arxiv_id or "",
         "pipeline_version": cache.PIPELINE_VERSION,
+        "line_spread": round(float(opts.line_spread), 3),
     }
     cache_key = cache.compute_cache_key(file_hash, cache_options)
 
@@ -188,6 +194,7 @@ async def create_task(
         scan_mode=opts.scan_mode,
         engine=opts.engine,
         arxiv_id=resolved_arxiv_id,
+        line_spread=opts.line_spread,
         auto_extract_glossary=opts.auto_extract_glossary,
         glossary_snapshot_json=json.dumps(snapshot, ensure_ascii=False)
         if snapshot else None,

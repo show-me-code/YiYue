@@ -49,6 +49,13 @@ def _migrate() -> None:
             conn.exec_driver_sql(
                 "UPDATE task SET engine_used='arxiv' "
                 "WHERE engine_used IS NULL AND arxiv_id IS NOT NULL")
+    if "line_spread" not in tcols:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE task ADD COLUMN line_spread FLOAT DEFAULT 1.3 NOT NULL")
+            # 旧任务的产出都是 1.0 行距；列描述"想要的行距"，重跑即按 1.3 出图
+            conn.exec_driver_sql(
+                "UPDATE task SET line_spread=1.3 WHERE line_spread IS NULL")
 
 
 def get_session():

@@ -78,6 +78,7 @@ export interface Task {
   scan_mode: string
   engine: 'auto' | 'arxiv' | 'babeldoc'
   engine_used: 'arxiv' | 'babeldoc' | null
+  line_spread: number
   arxiv_id: string | null
   cache_hit: boolean
   progress: TaskProgress
@@ -98,6 +99,7 @@ export interface UploadOptions {
   use_glossary: boolean
   engine: 'auto' | 'arxiv' | 'babeldoc'
   arxiv_id: string
+  line_spread: number
 }
 
 async function handle<T>(resp: Response): Promise<T> {

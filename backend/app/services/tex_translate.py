@@ -8,6 +8,7 @@
 
 import logging
 import re
+from fractions import Fraction
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -520,11 +521,21 @@ def repair_from_log(tex: str, log_text: str) -> str | None:
 # 汉化块放在 \begin{document} 之前，晚于作者自己的 \renewcommand{\figurename}…
 # 否则作者重定义会把我们的汉化覆盖回英文（实测 main.tex 第 39 行就是这么干的）。
 _CTEX_LINE = "\\usepackage[fontset=fandol]{ctex}\n"
-# ctex 会放大行距（实测 12 页变 14 页，与"原样保留版式"冲突），记录原值并还原。
+# ctex 会放大行距（实测 12 页变 14 页），这里改成**可控**：先记录文档原本的
+# \baselinestretch，再按任务选项放大 line_spread 倍。
+# 中文（Fandol）字形在同一字号下比 Times 大得多，沿用英文原版的 10.95pt 行距会显得
+# 很挤；中文排版惯例是 1.3 倍左右，所以默认放大，同时允许用户选"跟原文一致"。
+# 注意：Tectonic 自带的 LaTeX 是 2021 版，**没有 \fpeval**（实测直接
+# "Undefined control sequence" 导致整条 arXiv 路线失败回退），所以用 e-TeX 原生
+# \dimexpr 做定点乘法：\strip@pt\dimexpr <原值>\p@ * <分子> / <分母>。
 _CTEX_STRETCH_KEEP = (
+    "\\makeatletter\n"
     "\\edef\\yiyuekeptstretch{\\baselinestretch}\n"
+    "\\ifx\\yiyuekeptstretch\\empty\\edef\\yiyuekeptstretch{1}\\fi\n"
+    "\\edef\\yiyuespread{\\strip@pt\\dimexpr\\yiyuekeptstretch\\p@ * %d / %d\\relax}\n"
+    "\\makeatother\n"
     + _CTEX_LINE +
-    "\\linespread{\\yiyuekeptstretch}\\selectfont\n"
+    "\\linespread{\\yiyuespread}\\selectfont\n"
 )
 _LABEL_LOCALIZE = (
     "\\providecommand\\figurename{}\\providecommand\\tablename{}"
@@ -537,12 +548,13 @@ _LABEL_LOCALIZE = (
 )
 
 
-def prepare_for_xetex(tex: str, lang_out: str = "zh") -> str:
+def prepare_for_xetex(tex: str, lang_out: str = "zh", line_spread: float = 1.0) -> str:
     """中文重编译预处理（用户规格第 3 步）：
 
     - 用 ctex 宏包（Fandol 字体集）处理中文断行、标点禁则、中西文间距，
       叠加在原样式之上；不依赖系统字体（Fandol 随 TeX 发行版分发）；
-    - **还原 ctex 改动的行距**，保证版式与原版一致（页数不因注入而变）；
+    - **行距可调**：line_spread=1.0 与原文一致；中文排版惯例约 1.3（默认由任务选项传入）。
+      实现为「文档原本的 \\baselinestretch × line_spread」，不会把作者自己的行距设置抹掉；
     - 移除 XeTeX 下冲突的 inputenc/fontenc；
     - 汉化自动标签：图/表/参考文献/附录/摘要等，且放在导言区末尾执行，
       不会被作者自己的 \\renewcommand 覆盖。
@@ -553,11 +565,12 @@ def prepare_for_xetex(tex: str, lang_out: str = "zh") -> str:
     out = re.sub(r"(?m)^\\usepackage\[(?:[^\]]*)\]\{fontenc\}.*\n?", "", out)
     if not lang_out.startswith("zh") or "\\documentclass" not in out:
         return out
-    already = "fontset=fandol" in out
-    if not already:
+    spread = max(1.0, min(float(line_spread or 1.0), 2.0))
+    num, den = Fraction(spread).limit_denominator(100).as_integer_ratio()
+    if "fontset=fandol" not in out:
         out = re.sub(
             r"(?m)^(\\documentclass(?:\[[^\]]*\])?\{[^{}]*\}[^\n]*)$",
-            lambda m: m.group(1) + "\n" + _CTEX_STRETCH_KEEP,
+            lambda m: m.group(1) + "\n" + (_CTEX_STRETCH_KEEP % (num, den)),
             out,
             count=1,
         )

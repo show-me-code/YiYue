@@ -33,7 +33,12 @@ arxiv 引擎（services/arxiv_engine.py）:
        是真实语法，连同占位符一起替换会产出 \hbox$x$，编译报 "Missing { inserted."，
        进而触发整节退回英文——恢复后再比对一次花括号/$ 计数，任何结构破坏都回退原文
   5. 中文预处理（prepare_for_xetex）：
-     - 注入 ctex[fontset=fandol]；**记录并还原 ctex 改动的行距**（实测不改会 12 页→14 页）
+     - 注入 ctex[fontset=fandol]；**行距由任务选项控制**（`line_spread`，默认 1.3×
+       中文惯例，可设 1.0× 与原文完全一致）：实现为「文档原本的 \baselinestretch ×
+       line_spread」，用 e-TeX 的 \dimexpr 做定点乘法
+       （`\strip@pt\dimexpr\yiyuekeptstretch\p@ * 13 / 10\relax`）。
+       **注意不能用 \fpeval**：Tectonic 自带的 LaTeX2e 2021 没有该命令，实测直接
+       "Undefined control sequence"，让探针编译全失败并静默回退 BabelDOC。
      - 删除 inputenc/fontenc 行（XeTeX 冲突）
      - 汉化块插在 \begin{document} 之前（导言区最末），避免被作者自己的
        \renewcommand{\figurename}{Figure~} 覆盖

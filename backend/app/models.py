@@ -54,6 +54,7 @@ class Task(SQLModel, table=True):
     scan_mode: str = "off"  # off|workaround|auto
     engine: str = "auto"  # auto|arxiv|babeldoc（用户选择的引擎）
     engine_used: str | None = None  # arxiv|babeldoc（实际产出这份 PDF 的引擎）
+    line_spread: float = 1.3  # 行距倍数：1.0=跟原文一致，1.3≈中文排版惯例
     arxiv_id: str | None = None
     auto_extract_glossary: bool = False
     glossary_snapshot_json: str | None = None  # 术语快照，保证可复现

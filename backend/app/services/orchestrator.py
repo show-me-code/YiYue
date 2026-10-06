@@ -303,6 +303,12 @@ class TaskManager:
         self.broadcast(task_id, {"type": "done", "outputs": outputs,
                                  "engine_used": "babeldoc"})
 
+    @staticmethod
+    def _line_spread(task: Task) -> float:
+        """行距倍数：1.0=跟原文一致；中文排版惯例约 1.3（默认）。"""
+        value = getattr(task, "line_spread", None) or 1.3
+        return max(1.0, min(float(value), 2.0))
+
     def _babeldoc_cache_key(self, task: Task) -> str:
         """回退运行按 babeldoc 引擎计算缓存键（与 arXiv 键隔离）。"""
         options = {
@@ -315,6 +321,7 @@ class TaskManager:
             if task.glossary_snapshot_json else cache.glossary_hash([]),
             "engine": "babeldoc", "arxiv_id": task.arxiv_id or "",
             "pipeline_version": cache.PIPELINE_VERSION,
+            "line_spread": self._line_spread(task),
         }
         return cache.compute_cache_key(task.file_hash, options)
 
@@ -373,7 +380,8 @@ class TaskManager:
                 # 试编译即应用中文预处理：提前拉取 ctex/Fandol 宏包并暴露相关问题
                 text = probe_main.read_text("utf-8", errors="replace")
                 probe_main.write_text(
-                    tex_translate.prepare_for_xetex(text, task.lang_out), "utf-8")
+                    tex_translate.prepare_for_xetex(
+                        text, task.lang_out, self._line_spread(task)), "utf-8")
                 return probe_main
 
             probe_main = await asyncio.to_thread(_prepare_probe)
@@ -437,7 +445,8 @@ class TaskManager:
                 tex_translate.translate_tex, text, translator,
                 task.lang_out, chunk_cb(fi, rel.name), tex_stats,
             )
-            translated = tex_translate.prepare_for_xetex(translated, task.lang_out)
+            translated = tex_translate.prepare_for_xetex(
+                translated, task.lang_out, self._line_spread(task))
             target = out_src / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(target.write_text, translated, "utf-8")
