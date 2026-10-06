@@ -22,7 +22,8 @@ from sqlmodel import Session, select
 from app import config
 from app.db import engine
 from app.models import Profile, Task, TaskOutput
-from app.services import babeldoc_runner, cache, pdfops
+from app.services import arxiv_engine, babeldoc_runner, cache, pdfops, tectonic
+from app.services import tex_translate
 from app.services.babeldoc_runner import BabelDOCError, RunnerOptions
 from app.services.glossary import entries_to_glossaries
 
@@ -46,6 +47,7 @@ class TaskManager:
         self.current_task_id: int | None = None
         self._cancel_requested: set[int] = set()
         self._subscribers: dict[int, set[asyncio.Queue]] = {}
+        self._notes: dict[int, str] = {}  # 引擎回退等备注，完成时随任务展示
 
     # ---------- 订阅 ----------
     def subscribe(self, task_id: int) -> asyncio.Queue:
@@ -149,6 +151,7 @@ class TaskManager:
             self._inner = None
             self.current_task_id = None
             self._cancel_requested.discard(task_id)
+            self._notes.pop(task_id, None)
 
     async def _run_task(self, task_id: int) -> None:
         with Session(engine) as s:
@@ -167,7 +170,8 @@ class TaskManager:
         work_dir = task_dir / "work"
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        self._set_status(task_id, "translating", started_at=_now(), error=None)
+        self._set_status(task_id, "translating", started_at=_now(),
+                         error=self._notes.get(task_id))
         self._set_progress(
             task_id, part_index=0, part_total=0, stage="检查翻译服务",
             stage_progress=0, overall_progress=0, pages_done=0,
@@ -180,6 +184,30 @@ class TaskManager:
             profile, task.lang_in, task.lang_out
         )
         await asyncio.to_thread(babeldoc_runner.preflight, translator)
+
+        # 引擎路由：auto/arxiv 且检测到 arXiv ID → 走源码直译重编译；
+        # 任何失败自动回退下方 BabelDOC 原位排版路径
+        engine_kind = (task.engine or "auto")
+        arxiv_id = task.arxiv_id
+        if engine_kind in ("auto", "arxiv") and not arxiv_id:
+            arxiv_id = await asyncio.to_thread(
+                arxiv_engine.detect_arxiv_id, task.filename, str(original), None
+            )
+        if engine_kind in ("auto", "arxiv") and arxiv_id:
+            try:
+                await self._run_arxiv_task(task, profile, original, arxiv_id)
+                return
+            except TaskCancelled:
+                raise
+            except Exception as e:  # noqa: BLE001
+                note = f"arXiv 引擎失败（{str(e)[:160]}），已自动回退原位排版引擎。"
+                logger.warning("task %s arxiv engine failed: %s", task_id, e)
+                self._notes[task_id] = note
+                self._set_progress(
+                    task_id, part_index=0, part_total=1,
+                    stage="已回退原位排版引擎", stage_progress=0,
+                    overall_progress=0, pages_done=0,
+                )
 
         # 页码范围：先抽取所选页作为工作文件
         source = original
@@ -259,7 +287,147 @@ class TaskManager:
             task_id, part_index=part_total, part_total=part_total, stage="完成",
             stage_progress=100, overall_progress=100, pages_done=n_pages,
         )
-        self._set_status(task_id, "done", finished_at=_now(), error=None)
+        self._set_status(task_id, "done", finished_at=_now(),
+                         error=self._notes.get(task_id))
+        if task.cache_key:
+            cache.register_cache(task.cache_key, task_id)
+        self.broadcast(task_id, {"type": "done", "outputs": outputs})
+
+    # ---------- arXiv 源码直译引擎 ----------
+    async def _run_arxiv_task(self, task: Task, profile: Profile,
+                              original, arxiv_id: str) -> None:
+        """下载 LaTeX 源码 → 逐文件翻译（公式/引用保护）→ Tectonic 原模板重编译。"""
+        task_id = task.id
+        task_dir = config.TASKS_DIR / str(task_id)
+
+        self._set_progress(
+            task_id, part_index=0, part_total=1,
+            stage=f"下载 arXiv 源码（{arxiv_id}）", stage_progress=0,
+            overall_progress=2, pages_done=0,
+        )
+        src_dir = task_dir / "arxiv_src"
+        src_file = await asyncio.to_thread(
+            arxiv_engine.download_source, arxiv_id, src_dir
+        )
+        texs = await asyncio.to_thread(arxiv_engine.extract_source, src_file, src_dir)
+        candidates = await asyncio.to_thread(arxiv_engine.rank_main_tex, texs)
+        if not candidates:
+            raise arxiv_engine.ArxivEngineError("未找到主 tex 文件")
+        main_tex = candidates[0]
+        files = await asyncio.to_thread(
+            arxiv_engine.collect_doc_files, main_tex, texs
+        )
+        logger.info("task %s arxiv %s: main=%s files=%s",
+                    task_id, arxiv_id, main_tex.name, [f.name for f in files])
+
+        if tectonic.tectonic_path() is None:
+            self._set_progress(
+                task_id, part_index=0, part_total=1,
+                stage="下载 Tectonic 编译器（约 21MB，首次运行）",
+                stage_progress=0, overall_progress=5, pages_done=0,
+            )
+            await asyncio.to_thread(tectonic.download_tectonic)
+
+        # 先用未翻译源码验证哪个候选主文件可编译（arXiv 源码常见多个构建变体）
+        chosen: Path | None = None
+        for cand in candidates[:3]:
+            self._set_progress(
+                task_id, part_index=0, part_total=1,
+                stage=f"试编译候选主文件 {cand.name}",
+                stage_progress=0, overall_progress=6, pages_done=0,
+            )
+            probe_dir = task_dir / "arxiv_probe"
+
+            def _prepare_probe(dir_path: Path = probe_dir) -> Path:
+                if dir_path.exists():
+                    shutil.rmtree(dir_path)
+                shutil.copytree(src_dir, dir_path,
+                                ignore=shutil.ignore_patterns("source.bin"))
+                return dir_path / cand.relative_to(src_dir)
+
+            probe_main = await asyncio.to_thread(_prepare_probe)
+            try:
+                await asyncio.to_thread(
+                    tectonic.compile_tex, probe_main, probe_dir
+                )
+                chosen = cand
+                break
+            except Exception as e:  # noqa: BLE001
+                logger.warning("candidate %s failed to compile: %s",
+                               cand.name, str(e)[:200])
+        if chosen is None:
+            raise arxiv_engine.ArxivEngineError(
+                "所有候选主文件均无法编译（详见日志）"
+            )
+
+        # 复制完整源码树到输出目录（图片/样式/参考文献原样保留）
+        out_src = task_dir / "arxiv_out"
+        if out_src.exists():
+            shutil.rmtree(out_src)
+        await asyncio.to_thread(
+            shutil.copytree, src_dir, out_src,
+            ignore=shutil.ignore_patterns("source.bin"),
+        )
+
+        translator = babeldoc_runner.build_translator(
+            profile, task.lang_in, task.lang_out
+        )
+        files = await asyncio.to_thread(
+            arxiv_engine.collect_doc_files, chosen, texs
+        )
+        n_files = max(len(files), 1)
+
+        def chunk_cb(file_index: int, file_name: str):
+            def cb(stage: str, done: int, total: int) -> None:
+                if task.id in self._cancel_requested:
+                    raise TaskCancelled()
+                overall = 10 + 80 * (file_index + done / max(total, 1)) / n_files
+                self._set_progress(
+                    task_id, part_index=0, part_total=1,
+                    stage=f"{stage}：{file_name}",
+                    stage_progress=round(100 * done / max(total, 1)),
+                    overall_progress=round(min(overall, 90), 1), pages_done=0,
+                )
+            return cb
+
+        for fi, f in enumerate(files):
+            rel = f.relative_to(src_dir)
+            text = await asyncio.to_thread(
+                f.read_text, encoding="utf-8", errors="replace"
+            )
+            translated = await asyncio.to_thread(
+                tex_translate.translate_tex, text, translator,
+                task.lang_out, chunk_cb(fi, rel.name),
+            )
+            translated = tex_translate.prepare_for_xetex(translated, task.lang_out)
+            target = out_src / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(target.write_text, translated, "utf-8")
+
+        self._set_progress(
+            task_id, part_index=0, part_total=1, stage="Tectonic 编译",
+            stage_progress=0, overall_progress=92, pages_done=0,
+        )
+        main_out = out_src / chosen.relative_to(src_dir)
+        pdf = await asyncio.to_thread(tectonic.compile_tex, main_out, task_dir)
+        shutil.move(str(pdf), str(task_dir / "mono.pdf"))
+
+        outputs = [
+            {"kind": "original", "path": str(original)},
+            {"kind": "mono", "path": str(task_dir / "mono.pdf")},
+        ]
+        with Session(engine) as s:
+            for row in s.exec(select(TaskOutput).where(TaskOutput.task_id == task_id)):
+                s.delete(row)
+            for o in outputs:
+                s.add(TaskOutput(task_id=task_id, kind=o["kind"], path=o["path"]))
+            s.commit()
+        self._set_progress(
+            task_id, part_index=1, part_total=1, stage="完成",
+            stage_progress=100, overall_progress=100, pages_done=task.page_count,
+        )
+        self._set_status(task_id, "done", finished_at=_now(),
+                         error=self._notes.get(task_id))
         if task.cache_key:
             cache.register_cache(task.cache_key, task_id)
         self.broadcast(task_id, {"type": "done", "outputs": outputs})

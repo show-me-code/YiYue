@@ -22,6 +22,8 @@ const form = reactive<UploadOptions>({
   scan_mode: 'off',
   auto_extract_glossary: false,
   use_glossary: true,
+  engine: 'auto',
+  arxiv_id: '',
 })
 
 const STATUS_META: Record<Task['status'], { label: string; type: 'info' | 'primary' | 'warning' | 'success' | 'danger' }> = {
@@ -138,9 +140,29 @@ function progressPct(t: Task): number {
           </el-col>
         </el-row>
         <el-row :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="翻译引擎">
+              <el-radio-group v-model="form.engine">
+                <el-radio-button value="auto">自动</el-radio-button>
+                <el-radio-button value="arxiv">arXiv 直译</el-radio-button>
+                <el-radio-button value="babeldoc">原位排版</el-radio-button>
+              </el-radio-group>
+              <div class="muted">
+                自动：识别到 arXiv ID 时用「源码直译重编译」（排版与原版一致），
+                否则用原位排版引擎；失败自动回退。
+              </div>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="arXiv ID">
+              <el-input v-model="form.arxiv_id" placeholder="可选，如 1610.01644 或 arxiv.org/abs/… 链接" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row :gutter="12">
           <el-col :span="8">
             <el-form-item label="页码范围">
-              <el-input v-model="form.pages" placeholder="留空=全部，如 1-5,8" />
+              <el-input v-model="form.pages" placeholder="留空=全部，如 1-5,8（arXiv 直译时忽略）" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
@@ -179,6 +201,8 @@ function progressPct(t: Task): number {
         <b>{{ t.filename }}</b>
         <span class="muted">{{ t.page_count }} 页 · {{ fmtSize(t.size_bytes) }} · {{ t.lang_in }}→{{ t.lang_out }}</span>
         <el-tag v-if="t.cache_hit" size="small" type="success">缓存命中</el-tag>
+        <el-tag v-if="t.arxiv_id" size="small" type="warning">arXiv {{ t.arxiv_id }}</el-tag>
+        <el-tag v-if="t.engine === 'babeldoc'" size="small" type="info">原位排版</el-tag>
         <span v-if="t.pages" class="muted">页码 {{ t.pages }}</span>
         <span style="flex:1" />
         <el-button v-if="t.status === 'done'" size="small" type="primary" @click="openReader(t)">对照阅读</el-button>

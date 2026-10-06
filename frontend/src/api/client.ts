@@ -66,6 +66,8 @@ export interface Task {
   pages: string | null
   part_size: number
   scan_mode: string
+  engine: 'auto' | 'arxiv' | 'babeldoc'
+  arxiv_id: string | null
   cache_hit: boolean
   progress: TaskProgress
   created_at: string
@@ -82,6 +84,8 @@ export interface UploadOptions {
   scan_mode: string
   auto_extract_glossary: boolean
   use_glossary: boolean
+  engine: 'auto' | 'arxiv' | 'babeldoc'
+  arxiv_id: string
 }
 
 async function handle<T>(resp: Response): Promise<T> {

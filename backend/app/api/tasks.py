@@ -41,6 +41,8 @@ def _task_json(task: Task, outputs: list[TaskOutput] | None = None) -> dict:
         "pages": task.pages,
         "part_size": task.part_size,
         "scan_mode": task.scan_mode,
+        "engine": getattr(task, "engine", "auto"),
+        "arxiv_id": getattr(task, "arxiv_id", None),
         "auto_extract_glossary": task.auto_extract_glossary,
         "cache_hit": task.cache_key is not None and task.status == "done"
                      and task.error == "cache",
@@ -75,15 +77,20 @@ async def create_task(
     scan_mode: str = Form("off"),
     auto_extract_glossary: bool = Form(False),
     use_glossary: bool = Form(True),
+    engine: str = Form("auto"),
+    arxiv_id: str = Form(""),
     s: Session = Depends(get_session),
 ):
     opts = TaskOptionsIn(
         profile_id=profile_id, lang_in=lang_in, lang_out=lang_out,
         pages=pages or None, part_size=part_size, scan_mode=scan_mode,
         auto_extract_glossary=auto_extract_glossary, use_glossary=use_glossary,
+        engine=engine or "auto", arxiv_id=arxiv_id or None,
     )
     if opts.scan_mode not in ("off", "workaround", "auto"):
         raise HTTPException(400, "scan_mode 无效")
+    if opts.engine not in ("auto", "arxiv", "babeldoc"):
+        raise HTTPException(400, "engine 无效")
     if not s.get(Profile, opts.profile_id):
         raise HTTPException(400, "配置档不存在")
 
@@ -96,12 +103,36 @@ async def create_task(
 
     snapshot, ghash = _glossary_snapshot(s, opts.lang_out) \
         if opts.use_glossary else ([], cache.glossary_hash([]))
+
+    # 解析 arXiv ID（用户输入 > 文件名 > PDF 首页文本）
+    resolved_arxiv_id = None
+    if opts.engine in ("auto", "arxiv"):
+        import tempfile
+
+        from app.services.arxiv_engine import detect_arxiv_id
+
+        resolved_arxiv_id = detect_arxiv_id(
+            filename=file.filename or "", user_input=opts.arxiv_id or ""
+        )
+        if not resolved_arxiv_id:
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            tmp.write(data)
+            tmp.close()
+            try:
+                resolved_arxiv_id = detect_arxiv_id(pdf_path=tmp.name)
+            finally:
+                import os as _os
+
+                _os.unlink(tmp.name)
+
     cache_options = {
         "lang_in": opts.lang_in, "lang_out": opts.lang_out,
         "pages": opts.pages or "", "part_size": opts.part_size,
         "scan_mode": opts.scan_mode,
         "auto_extract_glossary": opts.auto_extract_glossary,
         "glossary": ghash,
+        "engine": opts.engine,
+        "arxiv_id": resolved_arxiv_id or "",
     }
     cache_key = cache.compute_cache_key(file_hash, cache_options)
 
@@ -111,6 +142,8 @@ async def create_task(
         profile_id=opts.profile_id, lang_in=opts.lang_in,
         lang_out=opts.lang_out, pages=opts.pages, part_size=opts.part_size,
         scan_mode=opts.scan_mode,
+        engine=opts.engine,
+        arxiv_id=resolved_arxiv_id,
         auto_extract_glossary=opts.auto_extract_glossary,
         glossary_snapshot_json=json.dumps(snapshot, ensure_ascii=False)
         if snapshot else None,

@@ -30,6 +30,15 @@ def _migrate() -> None:
                 "ALTER TABLE profile ADD COLUMN protocol VARCHAR "
                 "DEFAULT 'openai' NOT NULL"
             )
+    tcols = {c["name"] for c in insp.get_columns("task")}
+    if "engine" not in tcols:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE task ADD COLUMN engine VARCHAR DEFAULT 'auto' NOT NULL"
+            )
+    if "arxiv_id" not in tcols:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE task ADD COLUMN arxiv_id VARCHAR")
 
 
 def get_session():

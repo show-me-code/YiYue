@@ -44,3 +44,5 @@ class TaskOptionsIn(BaseModel):
     scan_mode: str = "off"  # off|workaround|auto
     auto_extract_glossary: bool = False
     use_glossary: bool = True
+    engine: str = "auto"  # auto|arxiv|babeldoc
+    arxiv_id: str | None = None
