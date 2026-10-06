@@ -60,11 +60,14 @@ function onFileChange(files: File[]) {
 }
 
 async function submit() {
-  if (!fileList.value.length) { ElMessage.warning('请先选择 PDF 文件'); return }
+  if (!fileList.value.length && !form.arxiv_id.trim()) {
+    ElMessage.warning('请上传 PDF 文件，或填写 arXiv ID（二选一即可）')
+    return
+  }
   if (!form.profile_id) { ElMessage.warning('请先在「API 配置」中添加配置档'); return }
   submitting.value = true
   try {
-    const task = await api.createTask(fileList.value[0], { ...form })
+    const task = await api.createTask(fileList.value[0] ?? null, { ...form })
     ElMessage.success(task.status === 'done' ? '缓存命中，任务已完成' : '任务已创建')
     fileList.value = []
     await refresh()
@@ -98,13 +101,17 @@ function progressPct(t: Task): number {
         :auto-upload="false"
         :limit="1"
         :on-change="(f: any) => onFileChange([f.raw])"
+        :on-remove="() => onFileChange([])"
         :show-file-list="true"
         accept="application/pdf"
       >
         <el-icon style="font-size:40px;color:#c0c4cc"><UploadFilled /></el-icon>
-        <div>拖拽 PDF 到此处，或点击选择</div>
+        <div>拖拽 PDF 到此处（可留空，改填 arXiv ID）</div>
         <template #tip>
-          <div class="muted">仅支持 PDF；上传后按下方选项排队翻译。</div>
+          <div class="muted">
+            支持 PDF；填写 arXiv ID 时可不上传文件，服务端自动下载源码与原文。
+            识别到 arXiv ID 的论文优先走「LaTeX 源码直译重编译」。
+          </div>
         </template>
       </el-upload>
 

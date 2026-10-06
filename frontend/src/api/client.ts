@@ -135,9 +135,9 @@ export const api = {
     fetch(`/api/glossary/${id}`, { method: 'DELETE' }).then(r => handle<{ ok: boolean }>(r)),
 
   // 任务
-  createTask: (file: File, o: UploadOptions) => {
+  createTask: (file: File | null, o: UploadOptions) => {
     const fd = new FormData()
-    fd.append('file', file)
+    if (file) fd.append('file', file)
     for (const [k, v] of Object.entries(o)) fd.append(k, String(v))
     return fetch('/api/tasks', { method: 'POST', body: fd }).then(r => handle<Task>(r))
   },

@@ -8,6 +8,7 @@
 
 import logging
 import re
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,34 @@ _LANG_NAMES = {"zh": "Simplified Chinese", "zt": "Traditional Chinese",
                "en": "English", "ja": "Japanese"}
 
 
+def _integrity_ok(src: str, dst: str) -> bool:
+    """校验译文块未破坏 LaTeX 结构。
+
+    - 全局：花括号与 $ 总数一致；
+    - 占位符邻位：源文中紧贴占位符的 { 和 } 必须在译文中原位保留
+      （实测 LLM 最典型的损伤是 \hbox{[[M1]]} → \hbox[[M1]] 吞掉邻位花括号，
+      即使在别处补偿使总数不变也会被此检查捕获）。
+    """
+    if dst.count("{") != src.count("{") or dst.count("}") != src.count("}"):
+        return False
+    if dst.count("$") != src.count("$"):
+        return False
+    for m in _PLACEHOLDER_RE.finditer(src):
+        tok = m.group(0)
+        i = dst.find(tok)
+        if i == -1:
+            return False
+        prev_s = src[m.start() - 1] if m.start() > 0 else ""
+        prev_d = dst[i - 1] if i > 0 else ""
+        nxt_s = src[m.end()] if m.end() < len(src) else ""
+        nxt_d = dst[i + len(tok)] if i + len(tok) < len(dst) else ""
+        if (prev_s == "{") != (prev_d == "{"):
+            return False
+        if (nxt_s == "}") != (nxt_d == "}"):
+            return False
+    return True
+
+
 def translate_tex(
     tex: str,
     translator,  # 具备 .translate(text) 的 BabelDOC 翻译器
@@ -185,6 +214,9 @@ def translate_tex(
             if n_src != n_out:
                 logger.warning("chunk %s placeholder mismatch %s→%s, revert",
                                i, n_src, n_out)
+            elif not _integrity_ok(chunk, candidate):
+                logger.warning("chunk %s brace/math integrity check failed, revert",
+                               i)
             else:
                 translated = candidate
         except Exception as e:  # noqa: BLE001
@@ -203,9 +235,9 @@ def translate_tex(
             pieces = []
             for chunk in _iter_chunks(cap_protected):
                 piece = translator.translate(chunk)
-                if len(_PLACEHOLDER_RE.findall(piece)) != len(
+                if (len(_PLACEHOLDER_RE.findall(piece)) != len(
                     _PLACEHOLDER_RE.findall(chunk)
-                ):
+                ) or not _integrity_ok(chunk, piece)):
                     piece = chunk
                 pieces.append(piece)
             all_caps[j] = _restore(" ".join(pieces), cap_protection)
@@ -257,16 +289,26 @@ def repair_from_log(tex: str, log_text: str) -> str | None:
 # ---- 预处理：字体与 XeTeX 兼容 ----
 
 def prepare_for_xetex(tex: str, lang_out: str = "zh") -> str:
-    """注入 xeCJK 字体设置，移除 XeTeX 下冲突的 inputenc/fontenc。"""
+    """中文重编译预处理（用户规格第 3 步）：
+
+    - 用 ctex 宏包（Fandol 字体集）处理中文断行、标点禁则、中西文间距，
+      叠加在原样式之上；不依赖系统字体（Fandol 随 TeX 发行版分发）；
+    - 移除 XeTeX 下冲突的 inputenc/fontenc；
+    - 汉化自动标签：图/表/参考文献/附录/摘要等。
+    样式文件里硬编码的 "Abstract" 由 patch_style_files 单独处理。
+    """
     out = tex
     out = re.sub(r"(?m)^\\usepackage\[(?:[^\]]*)\]\{inputenc\}.*\n?", "", out)
     out = re.sub(r"(?m)^\\usepackage\[(?:[^\]]*)\]\{fontenc\}.*\n?", "", out)
-    if lang_out.startswith("zh") and "xeCJK" not in out and "\\documentclass" in out:
+    if lang_out.startswith("zh") and "ctex" not in out and "\\documentclass" in out:
         inject = (
-            "\\usepackage{xeCJK}\n"
-            "\\setCJKmainfont{SimSun}\n"
-            "\\setCJKsansfont{Microsoft YaHei}\n"
-            "\\setCJKmonofont{SimSun}\n"
+            "\\usepackage[fontset=fandol]{ctex}\n"
+            "\\renewcommand\\figurename{图}\n"
+            "\\renewcommand\\tablename{表}\n"
+            "\\renewcommand\\refname{参考文献}\n"
+            "\\renewcommand\\abstractname{摘要}\n"
+            "\\renewcommand\\keywordsname{关键词}\n"
+            "\\renewcommand\\appendixname{附录}\n"
         )
         out = re.sub(
             r"(?m)^(\\documentclass(?:\[[^\]]*\])?\{[^{}]*\}[^\n]*)$",
@@ -275,3 +317,21 @@ def prepare_for_xetex(tex: str, lang_out: str = "zh") -> str:
             count=1,
         )
     return out
+
+
+def patch_style_files(src_root: Path) -> int:
+    """把 .sty/.cls 里硬编码的 "Abstract" 标题补丁为 "摘要"（返回修改文件数）。"""
+    changed = 0
+    for pattern in ("*.sty", "*.cls"):
+        for f in src_root.rglob(pattern):
+            try:
+                text = f.read_text("utf-8", errors="replace")
+            except OSError:
+                continue
+            if "Abstract" not in text:
+                continue
+            new = re.sub(r"(\{)Abstract(\})", r"\g<1>摘要\g<2>", text)
+            if new != text:
+                f.write_text(new, "utf-8")
+                changed += 1
+    return changed

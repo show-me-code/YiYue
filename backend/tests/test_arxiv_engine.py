@@ -81,10 +81,21 @@ def test_prepare_for_xetex():
     tex = "\\documentclass{article}\n\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\\begin{document}x\\end{document}\n"
     out = tex_translate.prepare_for_xetex(tex, "zh")
     assert "inputenc" not in out and "fontenc" not in out
-    assert "\\usepackage{xeCJK}" in out and "SimSun" in out
+    assert "ctex" in out and "fandol" in out
+    assert "\\renewcommand\\figurename{图}" in out
     # 非 zh 不注入
     out2 = tex_translate.prepare_for_xetex(tex, "en")
-    assert "xeCJK" not in out2
+    assert "ctex" not in out2
+
+
+def test_skeleton_integrity():
+    from app.services.tex_translate import _integrity_ok
+    src = "text \\hbox{[[M1]]} more [[M2]] $y$"
+    ok = "中文 \\hbox{[[M1]]} 更多 [[M2]] $y$"
+    # LLM 吞掉花括号（即使在别处补偿使总数不变）→ 必须检出
+    bad = "中文 \\hbox[[M1]] 的 {额外} [[M2]] $y$"
+    assert _integrity_ok(src, ok)
+    assert not _integrity_ok(src, bad)
 
 
 def test_find_main_tex(tmp_path):

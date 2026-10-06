@@ -49,7 +49,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "app": "yiyue"}
+        return {"status": "ok", "app": "yiyue", "version": "0.3.0-arxiv-engine"}
 
     # 生产模式：挂载前端构建产物
     dist = config.ROOT.parent / "frontend" / "dist"

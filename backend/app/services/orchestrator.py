@@ -14,6 +14,7 @@ import json
 import logging
 import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 from pypdf import PdfReader, PdfWriter
@@ -203,6 +204,9 @@ class TaskManager:
                 note = f"arXiv 引擎失败（{str(e)[:160]}），已自动回退原位排版引擎。"
                 logger.warning("task %s arxiv engine failed: %s", task_id, e)
                 self._notes[task_id] = note
+                # 缓存键改按实际执行的 babeldoc 引擎登记，避免污染 arXiv 键
+                task.cache_key = self._babeldoc_cache_key(task)
+                self._update_task(task_id, cache_key=task.cache_key)
                 self._set_progress(
                     task_id, part_index=0, part_total=1,
                     stage="已回退原位排版引擎", stage_progress=0,
@@ -293,6 +297,20 @@ class TaskManager:
             cache.register_cache(task.cache_key, task_id)
         self.broadcast(task_id, {"type": "done", "outputs": outputs})
 
+    def _babeldoc_cache_key(self, task: Task) -> str:
+        """回退运行按 babeldoc 引擎计算缓存键（与 arXiv 键隔离）。"""
+        options = {
+            "lang_in": task.lang_in, "lang_out": task.lang_out,
+            "pages": task.pages or "", "part_size": task.part_size,
+            "scan_mode": task.scan_mode,
+            "auto_extract_glossary": task.auto_extract_glossary,
+            "glossary": cache.glossary_hash(
+                json.loads(task.glossary_snapshot_json))
+            if task.glossary_snapshot_json else cache.glossary_hash([]),
+            "engine": "babeldoc", "arxiv_id": task.arxiv_id or "",
+        }
+        return cache.compute_cache_key(task.file_hash, options)
+
     # ---------- arXiv 源码直译引擎 ----------
     async def _run_arxiv_task(self, task: Task, profile: Profile,
                               original, arxiv_id: str) -> None:
@@ -343,7 +361,12 @@ class TaskManager:
                     shutil.rmtree(dir_path)
                 shutil.copytree(src_dir, dir_path,
                                 ignore=shutil.ignore_patterns("source.bin"))
-                return dir_path / cand.relative_to(src_dir)
+                probe_main = dir_path / cand.relative_to(src_dir)
+                # 试编译即应用中文预处理：提前拉取 ctex/Fandol 宏包并暴露相关问题
+                text = probe_main.read_text("utf-8", errors="replace")
+                probe_main.write_text(
+                    tex_translate.prepare_for_xetex(text, task.lang_out), "utf-8")
+                return probe_main
 
             probe_main = await asyncio.to_thread(_prepare_probe)
             try:
@@ -368,6 +391,8 @@ class TaskManager:
             shutil.copytree, src_dir, out_src,
             ignore=shutil.ignore_patterns("source.bin"),
         )
+        # 样式文件硬编码 "Abstract" → "摘要"（用户规格第 3 步）
+        await asyncio.to_thread(tex_translate.patch_style_files, out_src)
 
         translator = babeldoc_runner.build_translator(
             profile, task.lang_in, task.lang_out
@@ -409,7 +434,29 @@ class TaskManager:
             stage_progress=0, overall_progress=92, pages_done=0,
         )
         main_out = out_src / chosen.relative_to(src_dir)
-        pdf = await asyncio.to_thread(tectonic.compile_tex, main_out, task_dir)
+        pdf = None
+        for repair_round in range(3):
+            try:
+                pdf = await asyncio.to_thread(
+                    tectonic.compile_tex, main_out, task_dir
+                )
+                break
+            except Exception as e:  # noqa: BLE001
+                if repair_round == 2:
+                    raise
+                # 从日志定位报错文件，还原为原文后重试（局部降级优于整体失败）
+                log_path = task_dir / "main.log"
+                broken = await asyncio.to_thread(
+                    tectonic.find_broken_input_file, log_path, out_src
+                )
+                orig = (src_dir / broken.relative_to(out_src)) if broken else None
+                if broken is None or not orig.exists():
+                    raise
+                logger.warning("compile failed, restoring %s to original: %s",
+                               broken.name, str(e)[:160])
+                await asyncio.to_thread(shutil.copy, orig, broken)
+        if pdf is None:
+            raise arxiv_engine.ArxivEngineError("编译失败")
         shutil.move(str(pdf), str(task_dir / "mono.pdf"))
 
         outputs = [

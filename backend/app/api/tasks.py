@@ -68,7 +68,7 @@ def _glossary_snapshot(s: Session, lang_out: str) -> tuple[list[dict], str]:
 
 @router.post("")
 async def create_task(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
     profile_id: int = Form(...),
     lang_in: str = Form("en"),
     lang_out: str = Form("zh"),
@@ -94,36 +94,56 @@ async def create_task(
     if not s.get(Profile, opts.profile_id):
         raise HTTPException(400, "配置档不存在")
 
-    data = await file.read()
-    if len(data) > config.MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(400, f"文件超过 {config.MAX_UPLOAD_MB}MB 上限")
-    if not data.startswith(b"%PDF"):
-        raise HTTPException(400, "仅支持 PDF 文件")
-    file_hash = hashlib.sha256(data).hexdigest()
+    # ---- 文件：上传的 PDF，或按 arXiv ID 下载 ----
+    has_file = file is not None and bool(file.filename)
+    data: bytes | None = None
+    upload_name: str | None = None
+    if has_file:
+        data = await file.read()
+        if len(data) > config.MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(400, f"文件超过 {config.MAX_UPLOAD_MB}MB 上限")
+        if not data.startswith(b"%PDF"):
+            raise HTTPException(400, "仅支持 PDF 文件")
+        upload_name = file.filename
 
     snapshot, ghash = _glossary_snapshot(s, opts.lang_out) \
         if opts.use_glossary else ([], cache.glossary_hash([]))
 
-    # 解析 arXiv ID（用户输入 > 文件名 > PDF 首页文本）
+    # ---- 解析 arXiv ID：用户输入 > 文件名 > PDF 首页文本 ----
+    from app.services.arxiv_engine import ArxivEngineError, detect_arxiv_id
+
     resolved_arxiv_id = None
     if opts.engine in ("auto", "arxiv"):
-        import tempfile
-
-        from app.services.arxiv_engine import detect_arxiv_id
-
         resolved_arxiv_id = detect_arxiv_id(
-            filename=file.filename or "", user_input=opts.arxiv_id or ""
+            filename=upload_name or "", user_input=opts.arxiv_id or ""
         )
-        if not resolved_arxiv_id:
+        if not resolved_arxiv_id and data:
+            import os as _os
+            import tempfile
+
             tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
             tmp.write(data)
             tmp.close()
             try:
                 resolved_arxiv_id = detect_arxiv_id(pdf_path=tmp.name)
             finally:
-                import os as _os
-
                 _os.unlink(tmp.name)
+
+    if data is None:
+        # 仅提供 ID 的模式：必须有可解析的 ID，且引擎允许走 arXiv 路线
+        if opts.engine == "babeldoc":
+            raise HTTPException(400, "仅提供 arXiv ID 时，引擎需为「自动」或「arXiv 直译」")
+        if not resolved_arxiv_id:
+            raise HTTPException(400, "请上传 PDF 文件，或填写有效的 arXiv ID")
+        from app.services.arxiv_engine import download_pdf
+
+        try:
+            data = await asyncio.to_thread(download_pdf, resolved_arxiv_id)
+        except ArxivEngineError as e:
+            raise HTTPException(400, str(e)) from e
+
+    assert data is not None
+    file_hash = hashlib.sha256(data).hexdigest()
 
     cache_options = {
         "lang_in": opts.lang_in, "lang_out": opts.lang_out,
@@ -131,13 +151,17 @@ async def create_task(
         "scan_mode": opts.scan_mode,
         "auto_extract_glossary": opts.auto_extract_glossary,
         "glossary": ghash,
-        "engine": opts.engine,
+        # 缓存键按"解析后实际将执行的引擎"区分，避免回退结果污染 arXiv 键
+        "engine": "arxiv" if (opts.engine in ("auto", "arxiv")
+                              and resolved_arxiv_id) else "babeldoc",
         "arxiv_id": resolved_arxiv_id or "",
     }
     cache_key = cache.compute_cache_key(file_hash, cache_options)
 
+    default_name = f"arXiv-{resolved_arxiv_id}.pdf" if resolved_arxiv_id \
+        else "document.pdf"
     task = Task(
-        filename=file.filename or "document.pdf",
+        filename=upload_name or default_name,
         file_hash=file_hash, size_bytes=len(data),
         profile_id=opts.profile_id, lang_in=opts.lang_in,
         lang_out=opts.lang_out, pages=opts.pages, part_size=opts.part_size,

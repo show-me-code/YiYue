@@ -6,6 +6,7 @@ tectonic.exe。
 """
 
 import logging
+import re
 import shutil
 import subprocess
 import zipfile
@@ -83,6 +84,21 @@ def compile_tex(main_tex: Path, out_dir: Path, timeout_s: int = 900) -> Path:
     raise RuntimeError(log_tail or "编译失败")
 
 
+def find_broken_input_file(log_path: Path, src_root: Path) -> Path | None:
+    """从 LaTeX 日志定位报错时正在处理的 \input 文件（供上层还原重试）。"""
+    try:
+        text = log_path.read_text("utf-8", errors="replace")
+    except OSError:
+        return None
+    last_file = None
+    for m in re.finditer(r"\((\./[^()\s]+\.tex)", text):
+        last_file = m.group(1)
+    if not last_file:
+        return None
+    cand = (src_root / last_file[2:]).resolve()
+    return cand if cand.exists() else None
+
+
 def _compile_once(main_tex: Path, out_dir: Path, timeout_s: int) -> Path:
     exe = tectonic_path()
     if exe is None:
@@ -99,6 +115,26 @@ def _compile_once(main_tex: Path, out_dir: Path, timeout_s: int) -> Path:
     if proc.returncode != 0 or not pdf.exists():
         log = proc.stdout[-3000:] + "\n" + proc.stderr[-3000:]
         (out_dir / "compile.log").write_text(log, "utf-8")
-        raise RuntimeError(f"Tectonic 编译失败（exit {proc.returncode}），"
-                           f"日志见 compile.log 末尾：{log[-600:]}")
+        raise RuntimeError(
+            f"Tectonic 编译失败（exit {proc.returncode}）：{_extract_error_summary(out_dir)}")
     return pdf
+
+
+def _extract_error_summary(out_dir: Path) -> str:
+    """从 LaTeX 日志提取真实错误行（"!" 开头）与 tectonic error 行。"""
+    parts: list[str] = []
+    for log_file in sorted(out_dir.glob("*.log")) + [out_dir / "compile.log"]:
+        try:
+            text = log_file.read_text("utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"^(! .{0,200})", text, re.M):
+            line = m.group(1).strip()
+            if line not in parts:
+                parts.append(line)
+        for m in re.finditer(r"^(error: .{0,200})", text, re.M):
+            line = m.group(1).strip()
+            if line not in parts:
+                parts.append(line)
+    summary = " | ".join(parts[:5]) if parts else "未知错误（详见 compile.log）"
+    return summary[:500]

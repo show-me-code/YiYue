@@ -53,6 +53,27 @@ def detect_arxiv_id(filename: str = "", pdf_path: str | Path | None = None,
     return None
 
 
+def download_pdf(arxiv_id: str) -> bytes:
+    """下载论文原版 PDF（仅提供 ID、无上传文件时使用）。"""
+    url = f"https://arxiv.org/pdf/{arxiv_id}"
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=180, follow_redirects=True) as client:
+                r = client.get(url, headers=_UA)
+                r.raise_for_status()
+            if not r.content.startswith(b"%PDF"):
+                raise ArxivEngineError("下载的内容不是 PDF")
+            return r.content
+        except ArxivEngineError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning("download arxiv pdf attempt %s failed: %s",
+                           attempt + 1, e)
+    raise ArxivEngineError(f"arXiv PDF 下载失败：{last_err}")
+
+
 def download_source(arxiv_id: str, dest_dir: Path) -> Path:
     """下载 e-print 源码包到 dest_dir，返回本地文件路径。"""
     dest_dir.mkdir(parents=True, exist_ok=True)
