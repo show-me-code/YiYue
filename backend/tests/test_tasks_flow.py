@@ -43,6 +43,8 @@ def test_full_flow_with_parts(client, profile, tmp_path):
     pdf_bytes = client.get(mono_url).content
     assert len(PdfReader(sample).pages) == 3
     assert pdf_bytes.startswith(b"%PDF")
+    # 必须记录"实际产出这份 PDF 的引擎"，否则回退产出会被误当成源码直译
+    assert final["engine_used"] == "babeldoc"
 
     # Range 请求支持（pdf.js 需要）
     head = client.get(mono_url, headers={"Range": "bytes=0-99"})

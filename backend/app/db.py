@@ -39,6 +39,16 @@ def _migrate() -> None:
     if "arxiv_id" not in tcols:
         with engine.begin() as conn:
             conn.exec_driver_sql("ALTER TABLE task ADD COLUMN arxiv_id VARCHAR")
+    if "engine_used" not in tcols:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE task ADD COLUMN engine_used VARCHAR")
+            # 旧行回填：带"回退"备注的说明实际是 BabelDOC 产出；其余 arXiv 任务按 arxiv 记
+            conn.exec_driver_sql(
+                "UPDATE task SET engine_used='babeldoc' "
+                "WHERE engine_used IS NULL AND error LIKE '%回退%'")
+            conn.exec_driver_sql(
+                "UPDATE task SET engine_used='arxiv' "
+                "WHERE engine_used IS NULL AND arxiv_id IS NOT NULL")
 
 
 def get_session():

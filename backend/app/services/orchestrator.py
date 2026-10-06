@@ -206,12 +206,17 @@ class TaskManager:
                 self._notes[task_id] = note
                 # 缓存键改按实际执行的 babeldoc 引擎登记，避免污染 arXiv 键
                 task.cache_key = self._babeldoc_cache_key(task)
-                self._update_task(task_id, cache_key=task.cache_key)
+                self._update_task(task_id, cache_key=task.cache_key,
+                                  engine_used="babeldoc")
                 self._set_progress(
                     task_id, part_index=0, part_total=1,
                     stage="已回退原位排版引擎", stage_progress=0,
                     overall_progress=0, pages_done=0,
                 )
+                self.broadcast(task_id, {
+                    "type": "progress", "stage": "已回退原位排版引擎",
+                    "note": note, "engine_used": "babeldoc",
+                })
 
         # 页码范围：先抽取所选页作为工作文件
         source = original
@@ -292,10 +297,11 @@ class TaskManager:
             stage_progress=100, overall_progress=100, pages_done=n_pages,
         )
         self._set_status(task_id, "done", finished_at=_now(),
-                         error=self._notes.get(task_id))
+                         error=self._notes.get(task_id), engine_used="babeldoc")
         if task.cache_key:
             cache.register_cache(task.cache_key, task_id)
-        self.broadcast(task_id, {"type": "done", "outputs": outputs})
+        self.broadcast(task_id, {"type": "done", "outputs": outputs,
+                                 "engine_used": "babeldoc"})
 
     def _babeldoc_cache_key(self, task: Task) -> str:
         """回退运行按 babeldoc 引擎计算缓存键（与 arXiv 键隔离）。"""
@@ -357,11 +363,10 @@ class TaskManager:
                 stage=f"试编译候选主文件 {cand.name}",
                 stage_progress=0, overall_progress=6, pages_done=0,
             )
-            probe_dir = task_dir / "arxiv_probe"
+            probe_dir = await asyncio.to_thread(
+                arxiv_engine.fresh_dir, task_dir, "arxiv_probe")
 
             def _prepare_probe(dir_path: Path = probe_dir) -> Path:
-                if dir_path.exists():
-                    shutil.rmtree(dir_path)
                 shutil.copytree(src_dir, dir_path,
                                 ignore=shutil.ignore_patterns("source.bin"))
                 probe_main = dir_path / cand.relative_to(src_dir)
@@ -390,9 +395,8 @@ class TaskManager:
             )
 
         # 复制完整源码树到输出目录（图片/样式/参考文献原样保留）
-        out_src = task_dir / "arxiv_out"
-        if out_src.exists():
-            shutil.rmtree(out_src)
+        out_src = await asyncio.to_thread(
+            arxiv_engine.fresh_dir, task_dir, "arxiv_out")
         await asyncio.to_thread(
             shutil.copytree, src_dir, out_src,
             ignore=shutil.ignore_patterns("source.bin"),
@@ -512,10 +516,11 @@ class TaskManager:
             stage_progress=100, overall_progress=100, pages_done=task.page_count,
         )
         self._set_status(task_id, "done", finished_at=_now(),
-                         error=self._notes.get(task_id))
+                         error=self._notes.get(task_id), engine_used="arxiv")
         if task.cache_key:
             cache.register_cache(task.cache_key, task_id)
-        self.broadcast(task_id, {"type": "done", "outputs": outputs})
+        self.broadcast(task_id, {"type": "done", "outputs": outputs,
+                                 "engine_used": "arxiv"})
 
     # ---------- 段翻译 ----------
     async def _translate_part_with_retry(self, task: Task, profile: Profile,

@@ -5,6 +5,7 @@ import logging
 import re
 import shutil
 import tarfile
+import time
 from pathlib import Path
 
 import httpx
@@ -87,6 +88,28 @@ def cached_source_path(arxiv_id: str) -> Path:
     """源码缓存的存放路径（按 ID 规整文件名）。"""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", arxiv_id)
     return CACHE_DIR / safe / "source.bin"
+
+
+def fresh_dir(task_dir: Path, name: str, tries: int = 5) -> Path:
+    """返回一个可安全写入的目录。
+
+    先尝试清理同名旧目录；若被占用（Windows 上杀软/索引器会短暂持有刚写入的
+    目录，实测 rmtree 报 WinError 32），就换用带序号的新目录，而不是让整条
+    arXiv 路线失败并静默回退到 BabelDOC 排版。
+    """
+    task_dir = Path(task_dir)
+    for i in range(tries):
+        cand = task_dir / name if i == 0 else task_dir / f"{name}_{i}"
+        if not cand.exists():
+            return cand
+        try:
+            shutil.rmtree(cand)
+            return cand
+        except OSError as e:
+            logger.warning("清理 %s 失败（%s），改用一个新目录", cand, e)
+    fallback = task_dir / f"{name}_{int(time.time())}"
+    logger.warning("多次清理失败，使用 %s", fallback)
+    return fallback
 
 
 def download_source(arxiv_id: str, dest_dir: Path, use_cache: bool = True) -> Path:

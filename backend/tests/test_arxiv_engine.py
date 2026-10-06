@@ -1,6 +1,7 @@
 """arXiv 引擎单元测试：ID 检测 / 保护恢复 / 字体注入 / 主文件定位 / 闭环验证。"""
 
 import textwrap
+from pathlib import Path
 
 import pymupdf
 
@@ -194,6 +195,35 @@ def test_use_shipped_bbl_without_bbl(tmp_path):
     info = arxiv_engine.use_shipped_bbl(tmp_path, main)
     assert not info["applied"] and "没有 .bbl" in info["reason"]
     assert "\\bibliography{x}" in main.read_text("utf-8")
+
+
+def test_fresh_dir_escapes_locked_directory(tmp_path, monkeypatch):
+    """目录被占用（Windows 上杀软/索引器会短暂持有）时换新目录，而不是让任务失败。"""
+    locked = tmp_path / "arxiv_probe"
+    locked.mkdir()
+    (locked / "main.tex").write_text("x", "utf-8")
+
+    real_rmtree = arxiv_engine.shutil.rmtree
+
+    def flaky_rmtree(path, *a, **k):
+        if Path(path).name == "arxiv_probe":
+            raise OSError(32, "另一个程序正在使用此文件，进程无法访问。")
+        return real_rmtree(path, *a, **k)
+
+    monkeypatch.setattr(arxiv_engine.shutil, "rmtree", flaky_rmtree)
+    got = arxiv_engine.fresh_dir(tmp_path, "arxiv_probe")
+    assert got != locked and got.name == "arxiv_probe_1"
+    assert not got.exists()  # 交给调用方去创建
+    # 旧目录还在，不影响新目录使用
+    assert locked.exists()
+
+
+def test_fresh_dir_reuses_cleanable_directory(tmp_path):
+    d = tmp_path / "arxiv_out"
+    d.mkdir()
+    (d / "old.tex").write_text("old", "utf-8")
+    got = arxiv_engine.fresh_dir(tmp_path, "arxiv_out")
+    assert got == d and not d.exists()
 
 
 def test_download_source_uses_local_cache(tmp_path, monkeypatch):

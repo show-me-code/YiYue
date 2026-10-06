@@ -209,7 +209,11 @@ function progressPct(t: Task): number {
         <span class="muted">{{ t.page_count }} 页 · {{ fmtSize(t.size_bytes) }} · {{ t.lang_in }}→{{ t.lang_out }}</span>
         <el-tag v-if="t.cache_hit" size="small" type="success">缓存命中</el-tag>
         <el-tag v-if="t.arxiv_id" size="small" type="warning">arXiv {{ t.arxiv_id }}</el-tag>
-        <el-tag v-if="t.engine === 'babeldoc'" size="small" type="info">原位排版</el-tag>
+        <el-tag v-if="t.engine_used === 'arxiv'" size="small" type="success">arXiv 源码直译</el-tag>
+        <el-tag v-else-if="t.engine_used === 'babeldoc'" size="small" type="warning">
+          原位排版（PDF 模式，未走 LaTeX）
+        </el-tag>
+        <el-tag v-else-if="t.engine === 'babeldoc'" size="small" type="info">原位排版</el-tag>
         <el-tag
           v-if="t.verification" size="small"
           :type="t.verification.verdict === '通过' ? 'success' : 'warning'"
@@ -238,6 +242,10 @@ function progressPct(t: Task): number {
         <el-button v-if="(t.progress.pages_done ?? 0) > 0" link type="primary" size="small" @click="openReader(t)">立即阅读已完成部分</el-button>
       </div>
       <el-alert v-if="t.status === 'failed'" :title="t.error ?? '翻译失败'" type="error" :closable="false" style="margin-top:10px" />
+      <el-alert
+        v-else-if="t.status === 'done' && t.error"
+        :title="t.error" type="warning" :closable="false" show-icon style="margin-top:10px"
+      />
     </div>
   </div>
 </template>

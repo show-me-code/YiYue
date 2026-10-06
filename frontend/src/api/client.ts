@@ -77,6 +77,7 @@ export interface Task {
   part_size: number
   scan_mode: string
   engine: 'auto' | 'arxiv' | 'babeldoc'
+  engine_used: 'arxiv' | 'babeldoc' | null
   arxiv_id: string | null
   cache_hit: boolean
   progress: TaskProgress

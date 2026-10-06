@@ -77,11 +77,21 @@ onBeforeUnmount(() => source?.close())
       <el-tag size="small" :type="live ? 'primary' : task.status === 'done' ? 'success' : 'info'">
         {{ live ? `翻译中 · ${task.progress.stage ?? ''}` : task.status }}
       </el-tag>
+      <el-tag v-if="task.engine_used === 'arxiv'" size="small" type="success">
+        arXiv 源码直译（LaTeX 重编译）
+      </el-tag>
+      <el-tag v-else-if="task.engine_used === 'babeldoc'" size="small" type="warning">
+        原位排版（PDF 模式，未走 LaTeX）
+      </el-tag>
       <span class="muted">{{ pagesDone }}/{{ task.page_count }} 页可读</span>
       <span style="flex:1" />
       <el-link v-if="monoUrl" :href="monoUrl" target="_blank">译文 PDF</el-link>
       <el-link v-if="dualUrl" :href="dualUrl" target="_blank" style="margin-left:12px">双语 PDF</el-link>
       <el-link v-if="originalUrl" :href="originalUrl" target="_blank" style="margin-left:12px">原文</el-link>
+    </div>
+
+    <div v-if="task?.status === 'done' && task?.error" class="reader-note">
+      <el-alert :title="task.error" type="warning" :closable="false" show-icon />
     </div>
 
     <DualReader
@@ -116,6 +126,9 @@ onBeforeUnmount(() => source?.close())
   display: flex;
   align-items: center;
   justify-content: center;
+}
+.reader-note {
+  padding: 8px 14px 0;
 }
 .muted {
   color: #909399;

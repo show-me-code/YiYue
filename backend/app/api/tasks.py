@@ -58,6 +58,7 @@ def _task_json(task: Task, outputs: list[TaskOutput] | None = None) -> dict:
         "part_size": task.part_size,
         "scan_mode": task.scan_mode,
         "engine": getattr(task, "engine", "auto"),
+        "engine_used": getattr(task, "engine_used", None),
         "arxiv_id": getattr(task, "arxiv_id", None),
         "auto_extract_glossary": task.auto_extract_glossary,
         "cache_hit": task.cache_key is not None and task.status == "done"
