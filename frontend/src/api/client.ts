@@ -54,6 +54,16 @@ export interface TaskProgress {
   pages_done?: number
 }
 
+export interface TaskVerification {
+  verdict: string
+  reasons: string[]
+  notes: string[]
+  pages: { translated: number; baseline: number }
+  overflow: { translated_pages: number[]; baseline_pages: number[]; new_pages: number[] }
+  content: Record<string, unknown>
+  url: string
+}
+
 export interface Task {
   id: number
   filename: string
@@ -70,6 +80,7 @@ export interface Task {
   arxiv_id: string | null
   cache_hit: boolean
   progress: TaskProgress
+  verification: TaskVerification | null
   created_at: string
   finished_at: string | null
   outputs: TaskOutput[]

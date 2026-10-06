@@ -85,18 +85,25 @@ def compile_tex(main_tex: Path, out_dir: Path, timeout_s: int = 900) -> Path:
 
 
 def find_broken_input_file(log_path: Path, src_root: Path) -> Path | None:
-    """从 LaTeX 日志定位报错时正在处理的 \input 文件（供上层还原重试）。"""
+    r"""从 LaTeX 日志定位报错时正在处理的 \input 文件（供上层还原重试）。
+
+    日志中 \input{experiments} 记为 "(./experiments"（无扩展名），
+    主文件则带 .tex（如 "(./main.tex"）。
+    """
     try:
         text = log_path.read_text("utf-8", errors="replace")
     except OSError:
         return None
     last_file = None
-    for m in re.finditer(r"\((\./[^()\s]+\.tex)", text):
+    for m in re.finditer(r"\((\./[^()\s]+)", text):
         last_file = m.group(1)
     if not last_file:
         return None
-    cand = (src_root / last_file[2:]).resolve()
-    return cand if cand.exists() else None
+    for cand_path in (last_file, last_file + ".tex"):
+        cand = (src_root / cand_path[2:]).resolve()
+        if cand.exists():
+            return cand
+    return None
 
 
 def _compile_once(main_tex: Path, out_dir: Path, timeout_s: int) -> Path:

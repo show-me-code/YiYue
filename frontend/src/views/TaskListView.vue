@@ -210,6 +210,10 @@ function progressPct(t: Task): number {
         <el-tag v-if="t.cache_hit" size="small" type="success">缓存命中</el-tag>
         <el-tag v-if="t.arxiv_id" size="small" type="warning">arXiv {{ t.arxiv_id }}</el-tag>
         <el-tag v-if="t.engine === 'babeldoc'" size="small" type="info">原位排版</el-tag>
+        <el-tag
+          v-if="t.verification" size="small"
+          :type="t.verification.verdict === '通过' ? 'success' : 'warning'"
+        >闭环验证：{{ t.verification.verdict }}</el-tag>
         <span v-if="t.pages" class="muted">页码 {{ t.pages }}</span>
         <span style="flex:1" />
         <el-button v-if="t.status === 'done'" size="small" type="primary" @click="openReader(t)">对照阅读</el-button>

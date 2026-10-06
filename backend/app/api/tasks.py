@@ -29,6 +29,22 @@ def s_get_exists(task_id: int) -> bool:
 
 def _task_json(task: Task, outputs: list[TaskOutput] | None = None) -> dict:
     progress = json.loads(task.progress_json) if task.progress_json else {}
+    report_path = config.TASKS_DIR / str(task.id) / "verify" / "verify_report.json"
+    verification = None
+    if report_path.exists():
+        try:
+            rep = json.loads(report_path.read_text("utf-8"))
+            verification = {
+                "verdict": rep.get("verdict"),
+                "reasons": rep.get("reasons", []),
+                "notes": rep.get("notes", []),
+                "pages": rep.get("pages"),
+                "overflow": rep.get("overflow", {}),
+                "content": rep.get("content", {}),
+                "url": f"/api/tasks/{task.id}/verify",
+            }
+        except (OSError, json.JSONDecodeError):
+            verification = None
     return {
         "id": task.id,
         "filename": task.filename,
@@ -47,6 +63,7 @@ def _task_json(task: Task, outputs: list[TaskOutput] | None = None) -> dict:
         "cache_hit": task.cache_key is not None and task.status == "done"
                      and task.error == "cache",
         "progress": progress,
+        "verification": verification,
         "created_at": str(task.created_at),
         "finished_at": str(task.finished_at) if task.finished_at else None,
         "outputs": [
@@ -60,7 +77,8 @@ def _glossary_snapshot(s: Session, lang_out: str) -> tuple[list[dict], str]:
     """返回 (启用的适用条目快照, 其内容哈希)。"""
     entries = s.exec(select(GlossaryEntry).where(GlossaryEntry.enabled == True)).all()  # noqa: E712
     applicable = [
-        {"source": e.source, "target": e.target, "tgt_lang": e.tgt_lang}
+        {"source": e.source, "target": e.target, "tgt_lang": e.tgt_lang,
+         "enabled": True}
         for e in entries if not e.tgt_lang or e.tgt_lang == lang_out
     ]
     return applicable, cache.glossary_hash(applicable)
@@ -155,6 +173,7 @@ async def create_task(
         "engine": "arxiv" if (opts.engine in ("auto", "arxiv")
                               and resolved_arxiv_id) else "babeldoc",
         "arxiv_id": resolved_arxiv_id or "",
+        "pipeline_version": cache.PIPELINE_VERSION,
     }
     cache_key = cache.compute_cache_key(file_hash, cache_options)
 
@@ -229,6 +248,17 @@ def get_task(task_id: int, s: Session = Depends(get_session)):
         raise HTTPException(404, "任务不存在")
     outputs = s.exec(select(TaskOutput).where(TaskOutput.task_id == task_id)).all()
     return _task_json(task, outputs)
+
+
+@router.get("/{task_id}/verify")
+def get_task_verification(task_id: int, s: Session = Depends(get_session)):
+    """闭环版式验证报告（用户规格第 5 步）：逐页版心偏差、告警对比、结论。"""
+    if not s.get(Task, task_id):
+        raise HTTPException(404, "任务不存在")
+    report = config.TASKS_DIR / str(task_id) / "verify" / "verify_report.json"
+    if not report.exists():
+        raise HTTPException(404, "该任务没有验证报告（仅 arXiv 源码直译引擎产出）")
+    return json.loads(report.read_text("utf-8"))
 
 
 @router.post("/{task_id}/cancel")

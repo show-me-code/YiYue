@@ -12,6 +12,10 @@ from app import config
 
 INDEX_PATH = config.DATA_DIR / "cache-index.json"
 
+# 翻译/排版管线版本：修改预处理、提示词、宏包注入等会影响产出的逻辑时递增，
+# 使旧任务的缓存键失效——否则"修好了却仍命中旧产出"，改动等于没生效。
+PIPELINE_VERSION = "2026-10-06.7"
+
 
 def compute_cache_key(file_hash: str, options: dict) -> str:
     canonical = json.dumps(options, sort_keys=True, ensure_ascii=False)

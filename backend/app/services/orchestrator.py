@@ -23,8 +23,8 @@ from sqlmodel import Session, select
 from app import config
 from app.db import engine
 from app.models import Profile, Task, TaskOutput
-from app.services import arxiv_engine, babeldoc_runner, cache, pdfops, tectonic
-from app.services import tex_translate
+from app.services import (arxiv_engine, babeldoc_runner, cache, pdfops,
+                          tectonic, tex_translate, verify)
 from app.services.babeldoc_runner import BabelDOCError, RunnerOptions
 from app.services.glossary import entries_to_glossaries
 
@@ -308,6 +308,7 @@ class TaskManager:
                 json.loads(task.glossary_snapshot_json))
             if task.glossary_snapshot_json else cache.glossary_hash([]),
             "engine": "babeldoc", "arxiv_id": task.arxiv_id or "",
+            "pipeline_version": cache.PIPELINE_VERSION,
         }
         return cache.compute_cache_key(task.file_hash, options)
 
@@ -348,6 +349,8 @@ class TaskManager:
 
         # 先用未翻译源码验证哪个候选主文件可编译（arXiv 源码常见多个构建变体）
         chosen: Path | None = None
+        probe_pdf: Path | None = None
+        probe_main: Path | None = None
         for cand in candidates[:3]:
             self._set_progress(
                 task_id, part_index=0, part_total=1,
@@ -369,8 +372,11 @@ class TaskManager:
                 return probe_main
 
             probe_main = await asyncio.to_thread(_prepare_probe)
+            # 试编译同样先用作者的 .bbl，保证基线 = 译文（除语言外）唯一变量
+            await asyncio.to_thread(
+                arxiv_engine.use_shipped_bbl, probe_dir, probe_main)
             try:
-                await asyncio.to_thread(
+                probe_pdf = await asyncio.to_thread(
                     tectonic.compile_tex, probe_main, probe_dir
                 )
                 chosen = cand
@@ -415,6 +421,9 @@ class TaskManager:
                 )
             return cb
 
+        # 翻译阶段的问题计数（未翻译块/图注），进闭环验证报告
+        tex_stats: dict = {}
+
         for fi, f in enumerate(files):
             rel = f.relative_to(src_dir)
             text = await asyncio.to_thread(
@@ -422,7 +431,7 @@ class TaskManager:
             )
             translated = await asyncio.to_thread(
                 tex_translate.translate_tex, text, translator,
-                task.lang_out, chunk_cb(fi, rel.name),
+                task.lang_out, chunk_cb(fi, rel.name), tex_stats,
             )
             translated = tex_translate.prepare_for_xetex(translated, task.lang_out)
             target = out_src / rel
@@ -433,7 +442,12 @@ class TaskManager:
             task_id, part_index=0, part_total=1, stage="Tectonic 编译",
             stage_progress=0, overall_progress=92, pages_done=0,
         )
+        # .bbl 必须在译文写盘之后处理：翻译步骤是以源码目录为输入重写 out_src 的，
+        # 先改写会被覆盖回 \bibliography{...}，Tectonic 便去跑不存在的 .bib，
+        # 全篇 \cite 变成 (?) 且丢一整页参考文献。
         main_out = out_src / chosen.relative_to(src_dir)
+        bbl_info = await asyncio.to_thread(
+            arxiv_engine.use_shipped_bbl, out_src, main_out)
         pdf = None
         for repair_round in range(3):
             try:
@@ -454,10 +468,34 @@ class TaskManager:
                     raise
                 logger.warning("compile failed, restoring %s to original: %s",
                                broken.name, str(e)[:160])
+                # 局部降级＝该文件整节回到英文：必须记入验证报告，不能静默
+                tex_stats.setdefault("files_reverted", []).append(broken.name)
                 await asyncio.to_thread(shutil.copy, orig, broken)
         if pdf is None:
             raise arxiv_engine.ArxivEngineError("编译失败")
         shutil.move(str(pdf), str(task_dir / "mono.pdf"))
+
+        # ---- 闭环验证（用户规格第 5 步）：逐页渲染 + 墨迹版心测量 + 存疑区域放大
+        if probe_pdf is not None and probe_pdf.exists():
+            self._set_progress(
+                task_id, part_index=0, part_total=1,
+                stage="闭环验证：逐页渲染 + 版心测量",
+                stage_progress=0, overall_progress=96, pages_done=0,
+            )
+            issues = dict(tex_stats)
+            issues["bbl"] = bbl_info
+            report = await asyncio.to_thread(
+                verify.verify_translation,
+                task_dir / "mono.pdf", probe_pdf, task_dir / "verify",
+                tol=verify.DEFAULT_TOL_PT,
+                issues=issues,
+                translated_log=task_dir / "main.log",
+                baseline_log=probe_pdf.with_suffix(".log"),
+            )
+            if report["verdict"] != "通过":
+                note = "闭环验证：" + "；".join(report["reasons"][:3])
+                prev = self._notes.get(task_id)
+                self._notes[task_id] = f"{prev} {note}" if prev else note
 
         outputs = [
             {"kind": "original", "path": str(original)},

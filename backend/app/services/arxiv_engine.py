@@ -3,6 +3,7 @@
 import gzip
 import logging
 import re
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -191,3 +192,52 @@ def compile_ready_check(texs: list[Path]) -> None:
         except OSError:
             continue
     logger.warning("源码中未见 .bbl/thebibliography，参考文献可能无法编译")
+
+
+_BIBLIOGRAPHY_RE = re.compile(r"\\bibliography\{([^{}]+)\}")
+
+
+def _uncommented_lines(text: str):
+    return [ln for ln in text.splitlines() if not ln.lstrip().startswith("%")]
+
+
+def use_shipped_bbl(src_root: Path, main_tex: Path) -> dict:
+    r"""把作者自带的已编译参考文献（.bbl）真正用起来（用户规格第 1 步）。
+
+    arXiv 源码包里的 .bbl 常与 \bibliography{...} 的名字对不上（本文包的实例：
+    main.tex 写 \bibliography{alain17a}，包里却只有 main.bbl），于是所有
+    \cite 在编译后变成 (?) ——实测 35 处引用全部失效。改名还不够：Tectonic
+    检测到 \bibliography 会自己跑 BibTeX，用不存在的 .bib 覆盖掉 .bbl。
+    因此这里把 \bibliography{x} 直接改写为 \input{x.bbl}，引用即恢复。
+
+    返回 {"applied": bool, "reason": str, "mapping": [[x, 来源文件], ...]}
+    """
+    try:
+        text = main_tex.read_text("utf-8", errors="replace")
+    except OSError as e:
+        return {"applied": False, "reason": f"主文件不可读：{e}", "mapping": []}
+    hits = [m for ln in _uncommented_lines(text)
+            for m in _BIBLIOGRAPHY_RE.finditer(ln)]
+    if not hits:
+        return {"applied": False, "reason": "未使用 \\bibliography", "mapping": []}
+    bbls = sorted(p for p in src_root.rglob("*.bbl"))
+    if not bbls:
+        return {"applied": False, "reason": "源码包中没有 .bbl", "mapping": []}
+
+    names = [n.strip() for n in hits[0].group(1).split(",") if n.strip()]
+    if not names:
+        return {"applied": False, "reason": "\\bibliography 参数为空", "mapping": []}
+    mapping: list[list[str]] = []
+    for name in names:
+        target = main_tex.parent / f"{Path(name).name}.bbl"
+        if target.exists():
+            mapping.append([name, "自带同名 .bbl"])
+            continue
+        source = next((b for b in bbls if b.stem == main_tex.stem), bbls[0])
+        shutil.copy(source, target)
+        mapping.append([name, source.name])
+    new_text = _BIBLIOGRAPHY_RE.sub(
+        lambda m: "\\input{" + names[0] + ".bbl}", text, count=1)
+    main_tex.write_text(new_text, "utf-8")
+    logger.info("using authors' .bbl: %s", mapping)
+    return {"applied": True, "reason": "", "mapping": mapping}
