@@ -707,6 +707,112 @@ def test_apply_arxiv_prompts_without_custom_prompt():
     assert "yiyue_glossary" not in tr.params     # 没有术语就不加缓存参数
 
 
+# ---------- 并发翻译：顺序、统计合并、取消立刻生效 ----------
+
+def test_map_parallel_preserves_order_and_merges_stats():
+    import time as _t
+
+    class Tr:
+        def translate(self, text, ignore_cache=False):
+            if text.startswith("slow"):
+                _t.sleep(0.3)          # 第一块最慢：结果必须仍按输入顺序返回
+            return "译 " + text
+
+    chunks = [f"slow {i}" for i in range(1)] + [f"fast {i}" for i in range(5)]
+    stats: dict = {}
+    out = tex_translate._map_parallel(
+        tex_translate._chunk_worker(Tr(), False), chunks, stats, workers=4)
+    assert out == ["译 " + c for c in chunks]
+    assert stats.get("chunks_untranslated", 0) == 0
+
+
+def test_map_parallel_merges_failure_stats():
+    class Tr:
+        def translate(self, text, ignore_cache=False):
+            if "BAD" in text:
+                raise RuntimeError("boom")
+            return "译 " + text
+
+    chunks = ["ok one", "BAD one", "ok two"]
+    stats: dict = {}
+    out = tex_translate._map_parallel(
+        tex_translate._chunk_worker(Tr(), False), chunks, stats, workers=3)
+    assert out[0] == "译 ok one"
+    assert out[1] is None           # 失败块保留原文
+    assert out[2] == "译 ok two"
+    assert stats["chunks_untranslated"] == 1
+
+
+def test_map_parallel_cancel_returns_immediately():
+    """取消（progress_cb 抛 TaskCancelled）不能等排队中的块跑完。"""
+    import time as _t
+
+    from app.services.orchestrator import TaskCancelled
+
+    class Tr:
+        def translate(self, text, ignore_cache=False):
+            _t.sleep(0.4)
+            return "译 " + text
+
+    chunks = [f"c{i}" for i in range(12)]     # 串行要 ~4.8s，2 并发也要 ~2.4s
+    seen = {"n": 0}
+
+    def cb(stage, done, total):
+        seen["n"] += 1
+        if seen["n"] >= 2:
+            raise TaskCancelled()
+
+    start = _t.monotonic()
+    with pytest.raises(TaskCancelled):
+        tex_translate._map_parallel(
+            tex_translate._chunk_worker(Tr(), False), chunks, {},
+            workers=2, progress_cb=cb)
+    assert _t.monotonic() - start < 2
+
+
+def test_looks_untranslated_ignores_formula_heavy_chunks():
+    """回归：占位符（公式/命令）在原文与译文里逐字相同，混进相似度会把
+    "公式密集但正文确实翻了"的块算成高相似度，译文被无谓退回英文。"""
+    # 一个长块：大量受保护片段 + 少量英文散文，译文照翻了英文
+    body = "[[M0]] " * 120 + "We train linear classifiers on the features."
+    translated = "[[M0]] " * 120 + "我们在这些特征上训练线性分类器。"
+    assert not tex_translate._looks_untranslated(body, translated)
+
+    # 真的"原样返回"仍然要被抓住
+    assert tex_translate._looks_untranslated(body, body)
+    # 英文单词没减少（只加了个前缀）也算没翻
+    assert tex_translate._looks_untranslated(body, "译 " + body)
+
+
+def test_translate_tex_parallel_covers_all_chunks_and_captions():
+    import re as _re
+
+    class ZhTranslator:
+        """把英文单词换成中文，模拟真实翻译（保留占位符与命令）。"""
+
+        def translate(self, text, ignore_cache=False):
+            return _re.sub(r"[A-Za-z]{2,}", "中", text)
+
+    paras = [(f"Paragraph {i}: " + "some English prose words here. " * 12)
+             for i in range(9)]      # 总长 > CHUNK_CHARS，确保切成多块
+    tex = ("\\documentclass{article}\n\\title{My Title}\n\\begin{document}\n"
+           + "\n\n".join(paras)
+           + "\n\n\\begin{figure}\\caption{A caption here}\\end{figure}\n"
+           "\\end{document}\n")
+    stats: dict = {}
+    out = tex_translate.translate_tex(tex, ZhTranslator(), "zh", None, stats)
+
+    assert "[[" not in out                      # 占位符不能漏
+    assert "My Title" not in out and "\\title{" in out      # 标题被翻译
+    assert "A caption here" not in out                      # 图注被翻译
+    assert "prose" not in out                               # 正文被翻译
+    assert stats["captions_total"] == 2         # 1 个图注 + 1 个标题
+    assert stats["chunks_total"] >= 2           # 正文确实被切成多块
+    assert stats.get("chunks_untranslated", 0) == 0
+    assert stats.get("captions_untranslated", 0) == 0
+    assert (out.count("{"), out.count("}")) == (tex.count("{"), tex.count("}"))
+
+
 # ---------- 启动器：只清理我们自己的进程 ----------
 
 def test_free_stale_port_skips_foreign_process(tmp_path, monkeypatch):

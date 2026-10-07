@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 CHUNK_CHARS = 2500
 
+# 并发翻译的块数。实测单块请求要 1~2 分钟（思考型模型 + 长提示词），串行翻一篇
+# 60KB 的论文要 1.5~2 小时；这条路径的请求彼此独立，并发是唯一的墙钟杠杆。
+# 全局 qps 由 BabelDOC 的 RateLimiter 兜着，加大并发不会突破配置档的速率上限。
+TRANSLATE_WORKERS = max(1, int(os.environ.get("YIYUE_TRANSLATE_WORKERS", "4")))
+
 # 单块翻译的墙钟上限（秒），可用环境变量覆盖。
 # BabelDOC 的 do_translate 对 RateLimitError 会重试最多 100 次、退避最长 15s
 # （最坏 ≈25 分钟），HTTP 客户端超时还是 600s/次。真跑 2607.03728 时整篇卡在
@@ -371,6 +376,105 @@ _SECTION_CMD_RE = re.compile(
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
+def _merge_stats(target: dict, extra: dict) -> None:
+    """把子任务自己收集的统计并进总统计（数字相加、列表拼接）。"""
+    for key, value in extra.items():
+        if isinstance(value, bool):
+            target[key] = value
+        elif isinstance(value, (int, float)):
+            target[key] = target.get(key, 0) + value
+        elif isinstance(value, list):
+            target.setdefault(key, []).extend(value)
+        else:
+            target[key] = value
+
+
+def _map_parallel(worker, items: list, stats: dict | None, *,
+                  workers: int | None = None, progress_cb=None,
+                  progress_base: int = 0, progress_total: int | None = None,
+                  stage: str = "翻译正文") -> list:
+    """并发执行 `worker(item) -> (结果, 局部统计)`，返回值顺序与输入一致。
+
+    为什么并发：单块请求实测 1~2 分钟（思考型模型 + 长提示词），串行翻一篇 60KB
+    的论文要一两个钟头。各块彼此独立，BabelDOC 的 `TranslationCache`（对
+    "database is locked" 有兜底）与 `RateLimiter`（带锁）都是线程安全的，
+    并发只是把总墙钟除以并发度；速率上限仍由全局限流器兜住。
+
+    两条约束：
+    - **进度回调只在主线程发**：`_set_progress` 要写 SQLite + 广播，不能多线程写库；
+    - **取消要立刻生效**：回调抛异常（TaskCancelled）时取消未开始的块并立即返回，
+      不等排队中的块跑完（否则取消一次要等好几分钟）。
+    """
+    if not items:
+        return []
+    workers = max(1, workers or TRANSLATE_WORKERS)
+    total = progress_total if progress_total is not None else len(items)
+    results: list = [None] * len(items)
+    if workers == 1:
+        for i, item in enumerate(items):
+            results[i], local = worker(item)
+            if stats is not None:
+                _merge_stats(stats, local)
+            if progress_cb:
+                progress_cb(stage, progress_base + i + 1, total)
+        return results
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [pool.submit(worker, item) for item in items]
+        for i, future in enumerate(futures):
+            results[i], local = future.result()
+            if stats is not None:
+                _merge_stats(stats, local)
+            if progress_cb:
+                progress_cb(stage, progress_base + i + 1, total)
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=False)
+    return results
+
+
+def _chunk_worker(translator, is_caption: bool):
+    """构造正文块任务：统计用**局部字典**收集，回主线程再合并。
+
+    `_translate_chunk` 里是 `stats[key] = stats.get(key, 0) + 1`，多线程直接共享
+    一个 dict 会丢计数。
+    """
+    def worker(chunk: str):
+        local: dict = {}
+        return (_translate_chunk(translator, chunk, local, is_caption=is_caption),
+                local)
+    return worker
+
+
+def _caption_worker(translator):
+    """构造图注/标题任务：内部先分块翻译，再恢复并按源文校结构。"""
+    def worker(cap: str):
+        local: dict = {}
+        try:
+            cap_protected, cap_protection = _build_protection(cap)
+            pieces = []
+            for chunk in _iter_chunks(cap_protected):
+                piece = _translate_chunk(translator, chunk, local, is_caption=True)
+                pieces.append(piece if piece is not None else chunk)
+            restored = _restore(" ".join(pieces), cap_protection)
+            if _structure_counts(restored) == _structure_counts(cap):
+                return restored, local
+            logger.warning("caption structure broken after restore, keep source")
+            local["captions_untranslated"] = \
+                local.get("captions_untranslated", 0) + 1
+            return None, local
+        except Exception as e:  # noqa: BLE001
+            logger.warning("caption translate failed, keep original: %s", e)
+            local["captions_untranslated"] = \
+                local.get("captions_untranslated", 0) + 1
+            return None, local
+    return worker
+
+
 def _translate_english_titles(text: str, translator, stats: dict | None) -> str:
     """把仍是纯英文的章节标题与子图注做一次定点补译（正文块之外的兜底）。
 
@@ -429,14 +533,27 @@ def _translate_english_titles(text: str, translator, stats: dict | None) -> str:
     return text
 
 def _looks_untranslated(src: str, dst: str) -> bool:
-    """译文与原文几乎一致，且原文含足量英文单词 → 判为未翻译（多为历史坏缓存）。"""
+    """译文与原文几乎一致，且原文含足量英文单词 → 判为未翻译（多为历史坏缓存）。
+
+    只比较**可翻译文本**（去掉占位符）：公式、命令、引用在原文与译文里逐字相同，
+    混进来会把"公式密集但正文确实翻了"的块算成高相似度——2500 字符里只有几十个
+    英文单词的块相似度轻松 >0.97，译文就被无谓地退回英文。判定改成两条：
+    去掉占位符后逐字相同，或**英文单词数几乎没有减少**（译文是中文时英文单词必然
+    大幅消失）。
+    """
     if _english_word_count(src) < 5:
         return False
-    if dst.strip() == src.strip():
+    src_prose = _PLACEHOLDER_RE.sub("", src)
+    dst_prose = _PLACEHOLDER_RE.sub("", dst)
+    if dst_prose.strip() == src_prose.strip():
+        return True
+    n_src = _english_word_count(src_prose)
+    n_dst = _english_word_count(dst_prose)
+    if n_src and n_dst >= 0.8 * n_src:
         return True
     import difflib
 
-    return difflib.SequenceMatcher(None, src, dst).ratio() > 0.97
+    return difflib.SequenceMatcher(None, src_prose, dst_prose).ratio() > 0.97
 
 
 def _translate_chunk(translator, chunk: str, stats: dict | None = None,
@@ -529,8 +646,12 @@ def translate_tex(
         stats["chunks_total"] = stats.get("chunks_total", 0) + len(chunks)
         stats["captions_total"] = stats.get("captions_total", 0) + len(all_caps)
     out_chunks = []
-    for i, chunk in enumerate(chunks):
-        translated = _translate_chunk(translator, chunk, stats)
+    n_jobs = len(chunks) + len(all_caps)
+    body_results = _map_parallel(
+        _chunk_worker(translator, False), chunks, stats,
+        progress_cb=progress_cb, progress_total=n_jobs, stage="翻译正文",
+    )
+    for i, (chunk, translated) in enumerate(zip(chunks, body_results)):
         source_chunk = _restore(chunk, protected)
         if translated is not None:
             final = _restore(translated, protected)
@@ -545,34 +666,18 @@ def translate_tex(
         else:
             final = source_chunk
         out_chunks.append(final)
-        if progress_cb:
-            progress_cb("翻译正文", i + 1, len(chunks) + len(all_caps))
 
     new_body = "\n\n".join(out_chunks)
 
-    # 3) 翻译 caption / title 内容
-    for j, cap in enumerate(all_caps):
-        try:
-            cap_protected, cap_protection = _build_protection(cap)
-            pieces = []
-            for chunk in _iter_chunks(cap_protected):
-                piece = _translate_chunk(translator, chunk, stats, is_caption=True)
-                pieces.append(piece if piece is not None else chunk)
-            restored = _restore(" ".join(pieces), cap_protection)
-            if _structure_counts(restored) == _structure_counts(cap):
-                all_caps[j] = restored
-            else:
-                logger.warning("caption %s structure broken after restore, keep source", j)
-                if stats is not None:
-                    stats["captions_untranslated"] = \
-                        stats.get("captions_untranslated", 0) + 1
-        except Exception as e:  # noqa: BLE001
-            logger.warning("caption %s translate failed, keep original: %s", j, e)
-            if stats is not None:
-                stats["captions_untranslated"] = stats.get("captions_untranslated", 0) + 1
-        if progress_cb:
-            progress_cb("翻译图表标题", len(chunks) + j + 1,
-                        len(chunks) + len(all_caps))
+    # 3) 翻译 caption / title 内容（同样并发；每个图注一个任务）
+    cap_results = _map_parallel(
+        _caption_worker(translator), all_caps, stats,
+        progress_cb=progress_cb, progress_base=len(chunks),
+        progress_total=n_jobs, stage="翻译图表标题",
+    )
+    for j, restored in enumerate(cap_results):
+        if restored is not None:
+            all_caps[j] = restored
 
     def put_caps(text: str) -> str:
         # 用正则容忍 LLM 写出的 [[C 4]] / [[ C4 ]] 这类变体，否则会把
