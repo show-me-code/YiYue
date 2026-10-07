@@ -6,7 +6,9 @@
 - 分块按空行段落聚合，单块 ≤ CHUNK_CHARS；单块翻译失败保留原文，不拖垮整篇。
 """
 
+import concurrent.futures
 import logging
+import os
 import re
 from fractions import Fraction
 from pathlib import Path
@@ -16,6 +18,45 @@ from app.services import textio
 logger = logging.getLogger(__name__)
 
 CHUNK_CHARS = 2500
+
+# 单块翻译的墙钟上限（秒），可用环境变量覆盖。
+# BabelDOC 的 do_translate 对 RateLimitError 会重试最多 100 次、退避最长 15s
+# （最坏 ≈25 分钟），HTTP 客户端超时还是 600s/次。真跑 2607.03728 时整篇卡在
+# 某一块上 25 分钟没有任何进展、进程 CPU 也不涨——用户只看到"翻译中"永远不动。
+# 到点放弃这一块、保留原文继续：整篇至少能出成品，并把超时计入验证报告，不静默。
+CHUNK_TIMEOUT_S = float(os.environ.get("YIYUE_CHUNK_TIMEOUT_S", "300"))
+
+
+class ChunkTimeout(RuntimeError):
+    """单块翻译超过墙钟上限（区别于普通调用失败）。"""
+
+
+def _call_translator(translator, text: str, ignore_cache: bool = False,
+                     timeout: float | None = None) -> str:
+    """调用 translator.translate，带墙钟上限，避免一个卡死的请求拖死整篇。"""
+    timeout = CHUNK_TIMEOUT_S if timeout is None else timeout
+    kwargs = {"ignore_cache": True} if ignore_cache else {}
+    if not timeout or timeout <= 0:
+        return translator.translate(text, **kwargs)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(lambda: translator.translate(text, **kwargs))
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as e:
+            if timeout >= 10:
+                # 把当时所有线程的栈打到日志：真跑 2607.03728 时只看到"进度不动"、
+                # 进程 CPU 也不涨，无法定位卡在哪一层。下次再卡就有栈可查。
+                try:
+                    import faulthandler
+
+                    faulthandler.dump_traceback()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise ChunkTimeout(f"单块翻译超过 {timeout:.0f}s 未返回") from e
+    finally:
+        # 不等被放弃的请求：它可能还要跑几分钟，但整篇不能陪它一起等
+        pool.shutdown(wait=False)
 
 # 整体保护的环境（内部完全不动）
 _PROTECT_ENVS = [
@@ -329,7 +370,7 @@ def _translate_english_titles(text: str, translator, stats: dict | None) -> str:
             return  # 单词型子图注（如 "ResNet-50"）不值得再发一次请求
         protected, protection = _build_protection(content)
         try:
-            piece = translator.translate(protected)
+            piece = _call_translator(translator, protected)
         except Exception as e:  # noqa: BLE001
             logger.warning("label translate failed: %s", e)
             return
@@ -387,6 +428,7 @@ def _translate_chunk(translator, chunk: str, stats: dict | None = None,
     """
     key_fail = "captions_untranslated" if is_caption else "chunks_untranslated"
     key_retry = "identity_retries"
+    key_timeout = "captions_timeout" if is_caption else "chunks_timeout"
     n_src = len(_PLACEHOLDER_RE.findall(chunk))
 
     def acceptable(text: str) -> bool:
@@ -395,7 +437,14 @@ def _translate_chunk(translator, chunk: str, stats: dict | None = None,
                 and not _looks_untranslated(chunk, text))
 
     try:
-        candidate = translator.translate(chunk)
+        candidate = _call_translator(translator, chunk)
+    except ChunkTimeout as e:
+        # 超时不再重试：第一次就卡了 5 分钟，重试只会再等一个上限
+        logger.warning("chunk translate timed out, keep original: %s", e)
+        if stats is not None:
+            stats[key_timeout] = stats.get(key_timeout, 0) + 1
+            stats[key_fail] = stats.get(key_fail, 0) + 1
+        return None
     except Exception as e:  # noqa: BLE001
         logger.warning("chunk translate failed, keep original: %s", e)
         if stats is not None:
@@ -410,7 +459,7 @@ def _translate_chunk(translator, chunk: str, stats: dict | None = None,
     if stats is not None:
         stats[key_retry] = stats.get(key_retry, 0) + 1
     try:
-        retry = translator.translate(chunk, ignore_cache=True)
+        retry = _call_translator(translator, chunk, ignore_cache=True)
     except Exception as e:  # noqa: BLE001
         logger.warning("chunk retry failed, keep original: %s", e)
         if stats is not None:

@@ -455,6 +455,8 @@ class TaskManager:
         translator = babeldoc_runner.build_translator(
             profile, task.lang_in, task.lang_out
         )
+        # arXiv 路径直接调 translator.translate()，要显式应用配置档的 qps
+        babeldoc_runner.apply_rate_limit(profile)
         files = await asyncio.to_thread(
             arxiv_engine.collect_doc_files, chosen, texs
         )

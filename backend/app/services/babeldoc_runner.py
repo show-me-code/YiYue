@@ -137,6 +137,24 @@ def build_translator(profile: Profile, lang_in: str, lang_out: str):
     )
 
 
+def apply_rate_limit(profile: Profile) -> None:
+    """把配置档的 qps 应用到 BabelDOC 的**全局**翻译限流器。
+
+    BabelDOC 的 `TranslationConfig(qps=...)` 只在它自己的流水线里生效；arXiv 路径
+    是直接调 `translator.translate()`，不设就一直在用 BabelDOC 的默认 5 qps——
+    用户在配置档里填的速率被静默忽略（限流被对方端点触发时这一点很关键）。
+    """
+    qps = int(getattr(profile, "qps", 0) or 0)
+    if qps <= 0:
+        return
+    try:
+        from babeldoc.translator.translator import set_translate_rate_limiter
+    except ImportError:  # 上游模块位置变了就跳过，不影响翻译
+        logger.warning("找不到 set_translate_rate_limiter，qps 设置未生效")
+        return
+    set_translate_rate_limiter(qps)
+
+
 def preflight(translator) -> None:
     """任务开始前用一次真实调用验证翻译服务连通性（结果会进缓存，开销极小）。"""
     try:

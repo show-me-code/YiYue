@@ -466,6 +466,130 @@ def test_repair_returns_none_for_unknown_error():
     assert tex_translate.repair_from_log(tex, "! Undefined control sequence.") is None
 
 
+# ---------- 翻译卡死：单块墙钟上限 ----------
+
+def test_chunk_timeout_reverts_without_hanging(monkeypatch):
+    """回归：真跑 2607.03728 时整篇卡在某一块上 25 分钟不动
+    （BabelDOC 对 RateLimitError 重试最多 100 次、退避最长 15s，HTTP 超时 600s/次）。
+    单块必须有墙钟上限：到点保留原文继续，并计入统计。"""
+    import time
+
+    class Hanging:
+        def translate(self, text, ignore_cache=False):
+            time.sleep(30)          # 远超测试用的上限
+            return text
+
+    monkeypatch.setattr(tex_translate, "CHUNK_TIMEOUT_S", 0.3)
+    stats: dict = {}
+    start = time.monotonic()
+    out = tex_translate._translate_chunk(Hanging(), "Some English sentence here.", stats)
+    elapsed = time.monotonic() - start
+    assert out is None                        # 保留原文
+    assert elapsed < 5                        # 不会陪它等 30s
+    assert stats["chunks_timeout"] == 1
+    assert stats["chunks_untranslated"] == 1
+
+
+def test_chunk_timeout_not_retried(monkeypatch):
+    """超时不做 ignore_cache 重试：第一次就卡了，重试只会再等一个上限。"""
+    import time
+
+    class Hanging:
+        def __init__(self):
+            self.calls = 0
+
+        def translate(self, text, ignore_cache=False):
+            self.calls += 1
+            time.sleep(30)
+            return text
+
+    monkeypatch.setattr(tex_translate, "CHUNK_TIMEOUT_S", 0.2)
+    tr = Hanging()
+    stats: dict = {}
+    assert tex_translate._translate_chunk(tr, "Some English sentence here.", stats) is None
+    assert tr.calls == 1
+
+
+def test_call_translator_passes_through_normally():
+    class Tr:
+        def translate(self, text, ignore_cache=False):
+            return ("retry:" if ignore_cache else "") + text.upper()
+
+    assert tex_translate._call_translator(Tr(), "abc") == "ABC"
+    assert tex_translate._call_translator(Tr(), "abc", ignore_cache=True) == "retry:ABC"
+
+
+def test_translate_tex_survives_one_hanging_chunk(monkeypatch):
+    """整篇不会因为一块卡死而永远不结束。"""
+    import time
+
+    class PartlyHanging:
+        def translate(self, text, ignore_cache=False):
+            if "SLOW" in text:
+                time.sleep(30)
+            return "译 " + text
+
+    monkeypatch.setattr(tex_translate, "CHUNK_TIMEOUT_S", 0.3)
+    tex = ("\\documentclass{article}\n\\begin{document}\n"
+           "First paragraph with words.\n\nSLOW paragraph here.\n\n"
+           "\\begin{figure}\\caption{cap}\\end{figure}\n"
+           "\\end{document}\n")
+    stats: dict = {}
+    start = time.monotonic()
+    out = tex_translate.translate_tex(tex, PartlyHanging(), "zh", None, stats)
+    assert time.monotonic() - start < 10
+    assert "译 " in out                       # 正常块被翻译
+    assert "SLOW paragraph here." in out      # 卡死块保留原文
+    assert stats.get("chunks_timeout", 0) >= 1
+
+
+def test_apply_rate_limit_sets_babeldoc_limiter(monkeypatch):
+    import babeldoc.translator.translator as bt
+
+    calls: list[int] = []
+    monkeypatch.setattr(bt, "set_translate_rate_limiter", calls.append)
+
+    from app.services import babeldoc_runner
+
+    class P:
+        qps = 3
+
+    babeldoc_runner.apply_rate_limit(P())
+    assert calls == [3]
+
+    class Zero:
+        qps = 0
+
+    babeldoc_runner.apply_rate_limit(Zero())
+    assert calls == [3]        # 0/None 不动全局设置
+
+
+def test_verify_reports_timeouts_end_to_end(tmp_path):
+    """超时必须出现在验证报告的 reasons 里（不能静默）。"""
+    import pymupdf
+
+    from app.services import verify as v
+
+    def make(path, text):
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_textbox(pymupdf.Rect(72, 72, 520, 760), text, fontsize=12)
+        doc.save(path)
+        doc.close()
+
+    translated = tmp_path / "zh.pdf"
+    baseline = tmp_path / "src.pdf"
+    make(translated, "Translated body text. " * 20)
+    make(baseline, "Source body text. " * 20)
+    report = v.verify_translation(
+        translated, baseline, tmp_path / "verify",
+        issues={"chunks_timeout": 2, "captions_timeout": 1},
+    )
+    assert report["verdict"] == "需人工复核"
+    assert any("3 块翻译超时未返回" in r for r in report["reasons"])
+    assert (tmp_path / "verify" / "verify_report.json").exists()
+
+
 # ---------- 启动器：只清理我们自己的进程 ----------
 
 def test_free_stale_port_skips_foreign_process(tmp_path, monkeypatch):

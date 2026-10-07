@@ -347,6 +347,11 @@ def verify_translation(
         reasons.append(content["spacing_warning"])
     if issues.get("chunks_untranslated"):
         reasons.append(f"{issues['chunks_untranslated']} 个正文块未翻译（已保留英文）")
+    if issues.get("chunks_timeout") or issues.get("captions_timeout"):
+        n_to = (issues.get("chunks_timeout") or 0) + (issues.get("captions_timeout") or 0)
+        reasons.append(
+            f"{n_to} 块翻译超时未返回（已放弃该块并保留原文）："
+            "多为翻译服务被限流或单块过大，可调低配置档 qps 后重试")
     if issues.get("captions_untranslated"):
         # 阶段计数包含未渲染的条件分支，故先作提示；真被渲染出来的英文图注
         # 由上方的"图表标题仍是英文"检查兜住。
