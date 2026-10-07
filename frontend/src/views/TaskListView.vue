@@ -5,6 +5,7 @@ import { ElMessage, genFileId } from 'element-plus'
 import type { UploadInstance, UploadRawFile } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
 import { api, type Profile, type Task, type UploadOptions } from '../api/client'
+import { finishLabel, fmtDuration, fmtLocalTime } from '../utils/time'
 
 const router = useRouter()
 const uploadRef = ref<UploadInstance>()
@@ -249,6 +250,10 @@ function progressPct(t: Task): number {
           :type="t.verification.verdict === '通过' ? 'success' : 'warning'"
         >闭环验证：{{ t.verification.verdict }}</el-tag>
         <span v-if="t.pages" class="muted">页码 {{ t.pages }}</span>
+        <span v-if="finishLabel(t.status)" class="muted" :title="`创建于 ${fmtLocalTime(t.created_at)}`">
+          {{ finishLabel(t.status) }} {{ fmtLocalTime(t.finished_at) }}
+          <template v-if="fmtDuration(t.duration_s)">· 耗时 {{ fmtDuration(t.duration_s) }}</template>
+        </span>
         <span style="flex:1" />
         <el-button v-if="t.status === 'done'" size="small" type="primary" @click="openReader(t)">对照阅读</el-button>
         <el-button v-if="['queued','translating','merging'].includes(t.status)" size="small" @click="cancel(t)">取消</el-button>

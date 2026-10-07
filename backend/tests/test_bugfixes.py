@@ -874,6 +874,64 @@ def test_chunk_worker_keeps_failure_when_split_also_fails():
     assert local["chunks_untranslated"] >= 1
 
 
+# ---------- 任务时间：ISO 格式 + 耗时（前端按本地时区显示） ----------
+
+def test_task_json_timestamps_are_iso_with_duration():
+    r"""回归：原来 `str(datetime)` 给出 "2026-10-07 14:44:34.507355+00:00"
+    （空格分隔 + 6 位微秒），JS 的 new Date() 解析不确定，前端没法稳定显示
+    "完成时间"。统一成 ISO-8601 并附上后端算好的耗时。"""
+    from datetime import datetime, timedelta, timezone
+
+    from app.api.tasks import _task_json
+    from app.models import Task
+
+    created = datetime(2026, 10, 7, 14, 4, 0, tzinfo=timezone.utc)
+    finished = created + timedelta(minutes=36, seconds=34)
+    task = Task(filename="x.pdf", file_hash="h", size_bytes=1, profile_id=1,
+                status="done", created_at=created, finished_at=finished)
+    js = _task_json(task)
+    assert js["created_at"] == "2026-10-07T14:04:00+00:00"
+    assert js["finished_at"] == "2026-10-07T14:40:34+00:00"
+    assert js["duration_s"] == 2194.0
+    # 能被 JS 标准解析：带 T 分隔符且带时区偏移
+    assert "T" in js["finished_at"] and js["finished_at"].endswith("+00:00")
+
+    task.status = "translating"
+    task.finished_at = None
+    js2 = _task_json(task)
+    assert js2["finished_at"] is None and js2["duration_s"] is None
+
+
+def test_snapshot_carries_engine_and_finish_time():
+    """SSE 的 state 事件也要带上引擎与结束时间，否则这些字段只有在整表刷新时才更新。"""
+    from datetime import datetime, timezone
+
+    from app.models import Task
+    from app.services.orchestrator import TaskManager
+
+    task = Task(id=1, filename="x.pdf", file_hash="h", size_bytes=1, profile_id=1,
+                status="done", engine_used="arxiv",
+                created_at=datetime(2026, 10, 7, 14, 0, 0, tzinfo=timezone.utc),
+                finished_at=datetime(2026, 10, 7, 14, 10, 0, tzinfo=timezone.utc))
+    snap = TaskManager()._snapshot(task)
+    assert snap["engine_used"] == "arxiv"
+    assert snap["finished_at"] == "2026-10-07T14:10:00+00:00"
+    assert snap["duration_s"] == 600.0
+
+
+def test_timeutil_handles_missing_and_naive_values():
+    from app import timeutil
+
+    assert timeutil.iso(None) is None
+    assert timeutil.duration_s(None, None) is None
+    # 一方带时区一方不带（历史数据）不能抛错
+    from datetime import datetime, timezone
+
+    assert timeutil.duration_s(datetime(2026, 10, 7, 14, 0, 0),
+                               datetime(2026, 10, 7, 14, 10, 0,
+                                        tzinfo=timezone.utc)) is None
+
+
 # ---------- 验证器：别再误报"整节丢失""漏译" ----------
 
 def test_english_residue_split_classifies_graphics_text():

@@ -10,7 +10,7 @@ from fastapi import (APIRouter, Depends, File, Form, HTTPException, UploadFile)
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 
-from app import config
+from app import config, timeutil
 from app.db import engine, get_session
 from app.models import GlossaryEntry, Profile, Task, TaskOutput
 from app.schemas import TaskOptionsIn
@@ -66,8 +66,9 @@ def _task_json(task: Task, outputs: list[TaskOutput] | None = None) -> dict:
                      and task.error == "cache",
         "progress": progress,
         "verification": verification,
-        "created_at": str(task.created_at),
-        "finished_at": str(task.finished_at) if task.finished_at else None,
+        "created_at": timeutil.iso(task.created_at),
+        "finished_at": timeutil.iso(task.finished_at),
+        "duration_s": timeutil.duration_s(task.created_at, task.finished_at),
         "outputs": [
             {"kind": o.kind, "url": f"/api/tasks/{task.id}/files/{o.kind}"}
             for o in (outputs or [])

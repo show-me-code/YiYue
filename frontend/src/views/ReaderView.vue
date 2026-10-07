@@ -5,6 +5,7 @@ import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import DualReader from '../components/DualReader.vue'
 import { api, openTaskEvents, type Task } from '../api/client'
+import { finishLabel, fmtDuration, fmtLocalTime } from '../utils/time'
 
 const route = useRoute()
 const taskId = Number(route.params.id)
@@ -26,8 +27,10 @@ const live = computed(() =>
   ['queued', 'translating', 'merging'].includes(task.value?.status ?? ''))
 
 function applyTask(t: Task) {
-  task.value = t
-  const done = Math.max(t.progress.pages_done ?? 0, 0)
+  // **合并**而不是替换：SSE 的 state 事件带的是精简快照（不含 outputs/verification/
+  // 时间字段），直接覆盖会把已加载的输出、引擎标签、完成时间一起抹掉。
+  task.value = { ...(task.value ?? {}), ...t } as Task
+  const done = Math.max(t.progress?.pages_done ?? 0, 0)
   if (done > pagesDone.value) {
     // 有新页可读 → 触发译文面板重载
     pagesDone.value = t.status === 'done' ? t.page_count : done
@@ -76,6 +79,7 @@ onMounted(async () => {
       ElMessage.info('任务已取消')
     } else if (type === 'error') {
       closeEvents()
+      api.getTask(taskId).then(applyTask).catch(() => {})
       ElMessage.error(String(ev.message ?? '翻译失败'))
     }
   })
@@ -102,6 +106,14 @@ onBeforeUnmount(closeEvents)
         原位排版（PDF 模式，未走 LaTeX）
       </el-tag>
       <span class="muted">{{ pagesDone }}/{{ task.page_count }} 页可读</span>
+      <span
+        v-if="finishLabel(task.status)"
+        class="muted"
+        :title="`创建于 ${fmtLocalTime(task.created_at)}`"
+      >
+        {{ finishLabel(task.status) }} {{ fmtLocalTime(task.finished_at) }}
+        <template v-if="fmtDuration(task.duration_s)">· 耗时 {{ fmtDuration(task.duration_s) }}</template>
+      </span>
       <span style="flex:1" />
       <el-link v-if="monoUrl" :href="monoUrl" target="_blank">译文 PDF</el-link>
       <el-link v-if="dualUrl" :href="dualUrl" target="_blank" style="margin-left:12px">双语 PDF</el-link>

@@ -83,8 +83,11 @@ export interface Task {
   cache_hit: boolean
   progress: TaskProgress
   verification: TaskVerification | null
-  created_at: string
+  /** ISO-8601（带时区偏移），前端按本地时区格式化 */
+  created_at: string | null
   finished_at: string | null
+  /** 创建到结束的秒数（后端算好，前端不必再解析两个时间） */
+  duration_s: number | null
   outputs: TaskOutput[]
 }
 
@@ -165,8 +168,7 @@ export const api = {
     fetch(`/api/tasks/${id}`, { method: 'DELETE' }).then(r => handle<{ ok: boolean }>(r)),
 }
 
-/** 订阅任务 SSE 事件流，返回 EventSource 便于关闭。 */
-export function openTaskEvents(
+/** 订阅任务 SSE 事件流，返回 EventSource 便于关闭。 */export function openTaskEvents(
   taskId: number,
   onEvent: (ev: Record<string, unknown>) => void,
 ): EventSource {

@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from pypdf import PdfReader, PdfWriter
 from sqlmodel import Session, select
 
-from app import config
+from app import config, timeutil
 from app.db import engine
 from app.models import Profile, Task, TaskOutput
 from app.services import (arxiv_engine, babeldoc_runner, cache, pdfops,
@@ -147,6 +147,12 @@ class TaskManager:
             "lang_in": task.lang_in,
             "lang_out": task.lang_out,
             "pages_done": progress.get("pages_done", 0),
+            # SSE 的 state 事件也会被前端拿来更新卡片：把"实际引擎/结束时间/耗时"
+            # 一起带上，否则这些字段只能在整表刷新时才更新（或显示成旧值）。
+            "engine_used": getattr(task, "engine_used", None),
+            "created_at": timeutil.iso(task.created_at),
+            "finished_at": timeutil.iso(task.finished_at),
+            "duration_s": timeutil.duration_s(task.created_at, task.finished_at),
         }
 
     def _set_status(self, task_id: int, status: str, **fields) -> Task | None:
