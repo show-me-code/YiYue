@@ -4,7 +4,7 @@
 - 起因：按此前代码审查**已复核确认**的缺陷清单逐条修复（"按照之前核对的内容，进行修复"）
 - 真跑任务：
   - 任务 #8：`engine=arxiv`，`arxiv_id=1610.01644`，en→zh，行距 1.3× → **通过**
-  - 任务 #4：`engine=auto`，`arxiv_id=2607.03728`，en→zh（详见下文"另一篇"）
+  - 任务 #4：`engine=auto`，`arxiv_id=2607.03728`，en→zh（详见第四节与第六节）
 - 产物：
   - 译文 PDF：`backend/data/tasks/8/mono.pdf`（14 页）
   - 编译基线（同源码未翻译编译）：`backend/data/tasks/8/arxiv_probe/main.pdf`（16 页）
@@ -30,6 +30,8 @@
 标题抽查：`arxiv_out/main.tex:64` 为 `\title{理解中间层 \\ 使用线性分类器探针}` —— 中文标题正确落位。
 
 ## 二、本轮修复的缺陷（均先复现、后修复、带回归测试）
+
+共 29 项：下面 27 项来自审查清单，另 2 项（第 28、29 条）是这场真跑新暴露的。
 
 ### Critical
 
@@ -113,6 +115,10 @@
 26. **`ReaderView` 终态不关 SSE**：服务端生成器结束后 `EventSource` 不停自动重连，
     每次白占一条连接 + 一个订阅队列；`cancelled` 事件也无人处理。终态统一关闭并处理。
 27. **`el-upload` 缺 `on-exceed`**：`limit=1` 时再拖一个文件"点了没反应"。改为替换旧文件。
+28. **`repair_from_log` 支持 xcolor 选项冲突**（第四节）：论文 2607.03728 的源码本身
+    在本工具链下编译不过，整条 arXiv 路线回退原位排版。
+29. **单块翻译无墙钟上限 + arXiv 路径忽略配置档 qps**（第六节）：真跑时整篇可以卡死
+    25 分钟以上不报错；qps 被静默忽略。
 
 ## 三、本轮自己踩的坑（都是闭环真跑抓出来的，如实记录）
 
@@ -144,10 +150,33 @@
 冲突消失且作者要的 `table`/`dvipsnames` 功能照旧（属于"让源码能在本工具链下编译"，
 与"保留作者原版瑕疵"的原则不冲突——原版瑕疵指版式，不指编译不过）。
 
-## 五、复现方式
+## 六、任务 #4 的卡死诊断（本轮最后发现，已加防护）
+
+修好 xcolor 之后重跑任务 #4，试编译通过、进入正文翻译，然后**整篇卡住不动**：
+
+- 进度停在 main.tex 的 14% 超过 25 分钟；进程 CPU 累计只有 8.5s（完全空闲）；
+- 日志里既没有异常，也没有 tenacity 的重试告警——不是"在重试"，是真的僵在某一层。
+
+查 BabelDOC 0.6.4 的 `do_translate`（`translator/translator.py`）：对 `RateLimitError`
+`stop_after_attempt(100)` + `wait_exponential(min=1, max=15)`，HTTP 客户端超时 600s/次
+——最坏情况**单块**可以耗掉约 25 分钟；而我们的管线会一直等下去，用户只看到"翻译中"。
+
+已加两道防护：
+
+1. **单块墙钟上限**（默认 300s，`YIYUE_CHUNK_TIMEOUT_S` 可覆盖）：超时不重试、
+   该块保留原文继续，并计入 `chunks_timeout/captions_timeout` → 写进验证报告 reasons
+   （不静默）；超时时用 `faulthandler` 打印全部线程栈，下次再卡可直接定位层次。
+2. **arXiv 路径显式应用配置档 qps**：BabelDOC 的 `TranslationConfig(qps=...)` 只在它
+   自己的流水线里生效；arXiv 路径直接调 `translator.translate()`，以前一直在用
+   BabelDOC 默认的 5 qps，用户在配置档里填的速率被静默忽略。
+
+精确卡在哪一层尚未定论（现场没有栈可查），所以这次先让"卡死"变成"有上限、有记录、
+有栈可查"，并把任务 #4 取消（它是被中断后重跑的，不是成品产出）。
+
+## 七、复现方式
 
 ```bash
-cd backend && uv run pytest -q          # 112 项（含 52 项本轮回归测试）
+cd backend && uv run pytest -q          # 118 项（含 58 项本轮回归测试）
 
 # 真跑一篇（走真实 LLM）：
 #   POST /api/tasks  form: engine=arxiv, arxiv_id=1610.01644, profile_id=<真实配置档>
