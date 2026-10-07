@@ -292,6 +292,9 @@ def retry_task(task_id: int, s: Session = Depends(get_session)):
     s.commit()
     task.status = "queued"
     task.error = None
+    # 重试必须清掉上一轮的"实际引擎"：否则列表里会一直挂着上一轮的
+    # 「原位排版（PDF 模式）」标签，让人误以为这次也没走 LaTeX 源码。
+    task.engine_used = None
     task.progress_json = None
     task.finished_at = None
     s.add(task)

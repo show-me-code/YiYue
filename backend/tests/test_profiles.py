@@ -2,6 +2,11 @@
 
 
 def test_crud_and_default(client):
+    # 会话级共享数据目录：先清空配置档，才能断言"第一个自动默认"。
+    # 否则别的测试（或其 fixture）先建过一个配置档，这条就随执行顺序变红。
+    for p in client.get("/api/profiles").json():
+        client.delete(f"/api/profiles/{p['id']}")
+
     r = client.post("/api/profiles", json={
         "name": "p1", "base_url": "http://x/v1", "api_key": "sk-abcdef1234",
         "model": "m1"})

@@ -590,6 +590,45 @@ def test_verify_reports_timeouts_end_to_end(tmp_path):
     assert (tmp_path / "verify" / "verify_report.json").exists()
 
 
+# ---------- 实际引擎标注：不能挂上一轮的旧值 ----------
+
+def test_retry_clears_stale_engine_used(client):
+    """回归：试编译通过前引擎是上一轮回退留下的 babeldoc，重试后界面一直显示
+    「原位排版（PDF 模式）」，让人误以为没走 LaTeX 源码（实测 2607.03728 就是
+    这个观感：其实源码已下载并在用，只是第一次尝试因 xcolor 冲突回退过）。"""
+    from sqlmodel import Session
+
+    from app.db import engine as db_engine
+    from app.models import Task
+
+    with Session(db_engine) as s:
+        t = Task(filename="arXiv-2607.03728.pdf", file_hash="h", size_bytes=1,
+                 profile_id=1, status="cancelled",
+                 engine_used="babeldoc", arxiv_id="2607.03728")
+        s.add(t)
+        s.commit()
+        s.refresh(t)
+        task_id = t.id
+
+    resp = client.post(f"/api/tasks/{task_id}/retry")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["engine_used"] is None
+    assert resp.json()["status"] == "queued"
+
+
+def test_set_engine_used_updates_and_broadcasts(monkeypatch):
+    m = _manager()
+    seen: list[tuple] = []
+    m._update_task = lambda tid, **kw: seen.append(("update", tid, kw)) or object()
+    m._snapshot = lambda task: {"id": 1, "engine_used": "arxiv"}
+    m.broadcast = lambda tid, payload: seen.append(("broadcast", tid, payload))
+    m._set_engine_used(1, "arxiv")
+    assert seen[0] == ("update", 1, {"engine_used": "arxiv"})
+    assert seen[1][0] == "broadcast"
+    assert seen[1][2]["type"] == "state"
+    assert seen[1][2]["task"]["engine_used"] == "arxiv"
+
+
 # ---------- 启动器：只清理我们自己的进程 ----------
 
 def test_free_stale_port_skips_foreign_process(tmp_path, monkeypatch):

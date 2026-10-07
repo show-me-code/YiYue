@@ -155,6 +155,17 @@ class TaskManager:
             self.broadcast(task_id, {"type": "state", "task": self._snapshot(task)})
         return task
 
+    def _set_engine_used(self, task_id: int, value: str) -> None:
+        """记录并广播"实际使用的引擎"。
+
+        必须在**试编译通过时**就写：只在任务最后一步写的话，翻译期间（或被取消时）
+        界面上显示的是上一轮的旧值——用户会看到「原位排版（PDF 模式）」却其实正在
+        跑 LaTeX 源码直译。
+        """
+        task = self._update_task(task_id, engine_used=value)
+        if task:
+            self.broadcast(task_id, {"type": "state", "task": self._snapshot(task)})
+
     def _set_progress(self, task_id: int, **progress) -> None:
         task = self._update_task(task_id, progress_json=json.dumps(progress))
         if task:
@@ -244,8 +255,8 @@ class TaskManager:
                 self._notes[task_id] = note
                 # 缓存键改按实际执行的 babeldoc 引擎登记，避免污染 arXiv 键
                 task.cache_key = self._babeldoc_cache_key(task)
-                self._update_task(task_id, cache_key=task.cache_key,
-                                  engine_used="babeldoc")
+                self._update_task(task_id, cache_key=task.cache_key)
+                self._set_engine_used(task_id, "babeldoc")
                 self._set_progress(
                     task_id, part_index=0, part_total=1,
                     stage="已回退原位排版引擎", stage_progress=0,
@@ -441,6 +452,8 @@ class TaskManager:
             raise arxiv_engine.ArxivEngineError(
                 "所有候选主文件均无法编译（详见日志）"
             )
+        # 试编译通过 = 确定走源码直译，立刻标注（翻译期间界面就应显示正确引擎）
+        self._set_engine_used(task_id, "arxiv")
 
         # 复制完整源码树到输出目录（图片/样式/参考文献原样保留）
         out_src = await asyncio.to_thread(
