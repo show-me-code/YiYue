@@ -971,6 +971,50 @@ def test_verify_distinguishes_structural_revert_from_lost_prose(tmp_path):
     assert any("1 个正文块未翻译" in r for r in real_loss["reasons"])
 
 
+def test_integrity_ok_catches_dropped_structural_commands():
+    r"""回归：`\item`/`\\` 没有花括号，丢一个不会改变 {} 计数，但会真的改变排版
+    （两个列表项并成一条、该断的行不断），必须也被拦下。"""
+    ok = "\\begin{itemize}\\item one\\item two\\end{itemize}"
+    assert tex_translate._integrity_ok(ok, "\\begin{itemize}\\item 一\\item 二\\end{itemize}")
+    assert not tex_translate._integrity_ok(ok, "\\begin{itemize}\\item 一\\end{itemize}")
+
+    rows = "a \\\\ b \\\\ c"
+    assert tex_translate._integrity_ok(rows, "甲 \\\\ 乙 \\\\ 丙")
+    assert not tex_translate._integrity_ok(rows, "甲 \\\\ 乙 丙")
+
+
+def test_integrity_ok_rejects_placeholder_count_mismatch():
+    src = "text [[M0]] more [[M1]]"
+    assert tex_translate._integrity_ok(src, "文本 [[M0]] 更多 [[M1]]")
+    assert not tex_translate._integrity_ok(src, "文本 [[M0]] 更多")
+
+
+def test_verify_flags_placeholder_leaks(tmp_path):
+    """成品里残留 [[M7]]（PDF 上会印成 [M7]）必须判为需人工复核。"""
+    import pymupdf
+
+    from app.services import verify as v
+
+    def make(path, text):
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_textbox(pymupdf.Rect(72, 72, 520, 760), text, fontsize=12)
+        doc.save(path)
+        doc.close()
+
+    zh, src = tmp_path / "zh.pdf", tmp_path / "src.pdf"
+    make(zh, "正文里漏了占位符 [[M7]] 和 [[C3]]。")
+    make(src, "Source body text.")
+
+    report = v.verify_translation(
+        zh, src, tmp_path / "verify",
+        issues={"placeholder_leaks": ["main.tex:7:[[M7]]", "main.tex:9:[[C3]]"]})
+    assert report["verdict"] == "需人工复核"
+    assert report["content"]["placeholder_leaks_in_pdf"] == 2
+    assert any("残留占位符" in r for r in report["reasons"])
+    assert any("占位符字面量" in r for r in report["reasons"])
+
+
 # ---------- 启动器：只清理我们自己的进程 ----------
 
 def test_free_stale_port_skips_foreign_process(tmp_path, monkeypatch):

@@ -354,17 +354,28 @@ def system_prompt_for(lang_out: str, custom: str | None = None) -> str:
     return (custom + "\n\n" + rules) if custom else rules
 
 
+# 无花括号的结构命令：丢一个不会改变 {} 计数，却会真的改变排版
+# （`\item` 少一个 = 两个列表项并成一条；`\\` 少一个 = 该断的行不断）。
+_STRUCT_CMD_RE = re.compile(r"\\item\b|\\\\")
+
+
 def _integrity_ok(src: str, dst: str) -> bool:
     r"""校验译文块未破坏 LaTeX 结构。
 
     - 全局：花括号与 $ 总数一致；
-    - 占位符邻位：源文中紧贴占位符的 { 和 } 必须在译文中原位保留
+    - 无花括号结构命令（`\item`、`\\`）数量一致；
+    - 占位符数量一致 + 邻位：源文中紧贴占位符的 { 和 } 必须在译文中原位保留
       （实测 LLM 最典型的损伤是 \hbox{[[M1]]} → \hbox[[M1]] 吞掉邻位花括号，
-      即使在别处补偿使总数不变也会被此检查捕获）。
+      即使在别处补偿使总数不变也会被此检查捕获）。受保护的公式/命令/引用都以
+      占位符形式存在，所以"占位符数量一致"等价于这些命令一个没丢。
     """
     if dst.count("{") != src.count("{") or dst.count("}") != src.count("}"):
         return False
     if dst.count("$") != src.count("$"):
+        return False
+    if (len(_STRUCT_CMD_RE.findall(dst)) != len(_STRUCT_CMD_RE.findall(src))):
+        return False
+    if len(_PLACEHOLDER_RE.findall(dst)) != len(_PLACEHOLDER_RE.findall(src)):
         return False
     for m in _PLACEHOLDER_RE.finditer(src):
         tok = m.group(0)

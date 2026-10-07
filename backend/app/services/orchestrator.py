@@ -515,6 +515,13 @@ class TaskManager:
             tex_stats["section_cmds_out"] = (
                 tex_stats.get("section_cmds_out", 0)
                 + tex_translate.count_section_cmds(translated))
+            # 占位符泄漏：成品源码里残留 [[M#]]/[[C#]] 的话，PDF 上会直接印出
+            # "[M7]" 这种垃圾（并且意味着那处公式/命令没恢复回去）
+            splits = tex_stats.setdefault("placeholder_leaks", [])
+            for m in tex_translate._PLACEHOLDER_RE.finditer(translated):
+                if len(splits) < 8:
+                    line_no = translated[:m.start()].count("\n") + 1
+                    splits.append(f"{rel.name}:{line_no}:{m.group(0)}")
             target = out_src / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(target.write_text, translated, "utf-8")

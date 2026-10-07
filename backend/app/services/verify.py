@@ -75,6 +75,8 @@ def english_residue(text: str, ref_heading_re: re.Pattern = _REF_HEADING_RE,
 
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+# 占位符字面量：成品里出现即说明那处公式/命令没被恢复回去（PDF 上会印成 [M7]）
+_LEAK_RE = re.compile(r"\[\[\s*[MC]\s*\d+\s*\]\]")
 
 
 def _normalize_ws(text: str) -> str:
@@ -341,13 +343,15 @@ def verify_translation(
     text_t, text_b = _doc_text(doc_t), _doc_text(doc_b)
     residue, residue_graphics = english_residue_split(text_t, text_b)
     zh_captions = english_captions(text_t)
+    pdf_leaks = _LEAK_RE.findall(text_t)
+    issues = dict(issues or {})   # 后面多处按 dict 用；这里先归一化（早于原赋值点）
     content = {
         "captions_translated": len(_CAPTION_RE.findall(text_t)),
         "captions_baseline": len(_CAPTION_RE.findall(text_b)),
         "sections_translated": section_count(text_t),
         "sections_baseline": section_count(text_b),
-        "section_cmds_in": issues.get("section_cmds_in") if issues else None,
-        "section_cmds_out": issues.get("section_cmds_out") if issues else None,
+        "section_cmds_in": issues.get("section_cmds_in"),
+        "section_cmds_out": issues.get("section_cmds_out"),
         "references_heading": bool(_REF_HEADING_RE.search(text_t)),
         "english_lines": len(residue),
         "english_sample": residue[0][:160] if residue else None,
@@ -355,6 +359,8 @@ def verify_translation(
         "english_graphics_sample": residue_graphics[0][:120] if residue_graphics else None,
         "english_captions": len(zh_captions),
         "english_caption_sample": zh_captions[0] if zh_captions else None,
+        "placeholder_leaks_in_tex": len(issues.get("placeholder_leaks") or []),
+        "placeholder_leaks_in_pdf": len(pdf_leaks),
     }
     spacing_t = spacing_profile(doc_t)
     spacing_b = spacing_profile(doc_b)
@@ -370,7 +376,6 @@ def verify_translation(
                 + "，行距不统一")
     stats_t, stats_b = log_stats(translated_log), log_stats(baseline_log)
     overfull_new = max(0, stats_t.get("overfull_hbox", 0) - stats_b.get("overfull_hbox", 0))
-    issues = dict(issues or {})
 
     reasons: list[str] = []
     notes: list[str] = []
@@ -423,6 +428,14 @@ def verify_translation(
             notes.append(
                 f"{n_failed} 个块被回退为原文，但合计只涉及 {words} 个英文词 → "
                 f"属纯命令/结构块（无正文可译），成品内容无损失{extra}")
+    if issues.get("placeholder_leaks"):
+        leaks = issues["placeholder_leaks"]
+        shown = "、".join(str(x) for x in list(leaks)[:3])
+        reasons.append(f"成品源码里残留占位符 {len(leaks)} 处（PDF 上会印出 [M7] 这类"
+                       f"垃圾，且那处公式/命令未恢复）：{shown}")
+    if pdf_leaks:
+        reasons.append(f"成品 PDF 文本里出现占位符字面量 {len(pdf_leaks)} 处："
+                       f"{'、'.join(pdf_leaks[:3])}")
     if issues.get("chunks_split_recovered"):
         notes.append(f"{issues['chunks_split_recovered']} 个正文块整块翻译失败后"
                      "拆成两半重试成功（内容已完整翻译）")
