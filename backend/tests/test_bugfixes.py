@@ -629,6 +629,84 @@ def test_set_engine_used_updates_and_broadcasts(monkeypatch):
     assert seen[1][2]["task"]["engine_used"] == "arxiv"
 
 
+# ---------- arXiv 路径的提示词：自定义规范 + 术语表必须送到模型 ----------
+
+def test_system_prompt_for_includes_placeholder_rules():
+    default = tex_translate.system_prompt_for("zh")
+    assert "Simplified Chinese" in default
+    assert "[[M12]]" in default          # 占位符规则必须真的送给模型
+    assert "Traditional Chinese" in tex_translate.system_prompt_for("zt")
+
+    custom = tex_translate.system_prompt_for("zh", "学术翻译规范：信达雅")
+    assert custom.startswith("学术翻译规范")
+    assert "[[M12]]" in custom           # 自定义规范之后仍带上结构规则
+
+
+def test_apply_arxiv_prompts_rewrites_system_and_user(monkeypatch):
+    """回归：arXiv 路径用 do_translate 的写死提示词，配置档自定义规范、
+    术语表、占位符规则全都不会到达模型（只在 BabelDOC 自己的流水线里生效）。"""
+    from app.services import babeldoc_runner
+
+    class FakeTranslator:
+        def __init__(self):
+            self.params: dict = {}
+
+        def prompt(self, text):
+            return [
+                {"role": "system",
+                 "content": "You are a professional,authentic machine translation engine."},
+                {"role": "user", "content": f";; Input:\n\n{text}"},
+            ]
+
+        def add_cache_impact_parameters(self, k, v):
+            self.params[k] = v
+
+    class P:
+        custom_system_prompt = "学术翻译规范：信、达、雅"
+
+    tr = FakeTranslator()
+    changed = babeldoc_runner.apply_arxiv_prompts(
+        tr, P(), "zh", [{"source": "probe", "target": "探针"},
+                        {"source": "layer", "target": "层"}])
+    assert changed is True
+
+    messages = tr.prompt("Hello [[M0]]")
+    assert messages[0]["content"].startswith("学术翻译规范")
+    assert "[[M12]]" in messages[0]["content"]        # 结构规则也带上了
+    assert "probe → 探针" in messages[0]["content"]   # 术语在 system 里
+    assert "layer → 层" in messages[0]["content"]
+    # user 消息必须保持原样：它的模板写死 "Treat next line as plain text input"，
+    # 往里塞术语表有被当成待翻译正文的风险
+    assert messages[1]["content"].endswith("Hello [[M0]]")
+    # 提示词/术语变了必须刷新缓存影响参数，否则会命中旧译文
+    assert "prompt" in tr.params and "yiyue_glossary" in tr.params
+
+
+def test_apply_arxiv_prompts_without_custom_prompt():
+    from app.services import babeldoc_runner
+
+    class FakeTranslator:
+        def __init__(self):
+            self.params: dict = {}
+
+        def prompt(self, text):
+            return [{"role": "system", "content": "OLD"},
+                    {"role": "user", "content": text}]
+
+        def add_cache_impact_parameters(self, k, v):
+            self.params[k] = v
+
+    class P:
+        custom_system_prompt = None
+
+    tr = FakeTranslator()
+    babeldoc_runner.apply_arxiv_prompts(tr, P(), "zh", [])
+    messages = tr.prompt("x")
+    assert messages[0]["content"] != "OLD"
+    assert "[[M12]]" in messages[0]["content"]   # 没有自定义规范时也要有结构规则
+    assert "yiyue_glossary" not in tr.params     # 没有术语就不加缓存参数
+
+
 # ---------- 启动器：只清理我们自己的进程 ----------
 
 def test_free_stale_port_skips_foreign_process(tmp_path, monkeypatch):

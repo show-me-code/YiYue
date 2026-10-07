@@ -470,6 +470,13 @@ class TaskManager:
         )
         # arXiv 路径直接调 translator.translate()，要显式应用配置档的 qps
         babeldoc_runner.apply_rate_limit(profile)
+        # 并显式注入自定义系统提示词 + 术语表（否则 arXiv 直译会静默丢掉它们）
+        glossary_entries = (
+            json.loads(task.glossary_snapshot_json)
+            if task.glossary_snapshot_json else []
+        )
+        babeldoc_runner.apply_arxiv_prompts(
+            translator, profile, task.lang_out, glossary_entries)
         files = await asyncio.to_thread(
             arxiv_engine.collect_doc_files, chosen, texs
         )

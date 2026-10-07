@@ -28,6 +28,7 @@ from babeldoc.glossary import Glossary
 from babeldoc.translator.translator import OpenAITranslator
 
 from app.models import Profile
+from app.services import tex_translate
 from app.services.anthropic_translator import AnthropicTranslator
 
 logger = logging.getLogger(__name__)
@@ -153,6 +154,58 @@ def apply_rate_limit(profile: Profile) -> None:
         logger.warning("找不到 set_translate_rate_limiter，qps 设置未生效")
         return
     set_translate_rate_limiter(qps)
+
+
+def apply_arxiv_prompts(translator, profile: Profile, lang_out: str,
+                        glossary_entries: list[dict] | None = None) -> bool:
+    """让 arXiv 源码直译路径也用上「自定义系统提示词 + 术语表 + 占位符规则」。
+
+    背景（实测）：arXiv 路径直接调 `translator.translate(text)`，BabelDOC 的
+    `OpenAITranslator.do_translate` 用的是写死的极简提示词——
+
+        system: You are a professional,authentic machine translation engine.
+        user:   ;; Treat next line as plain text input and translate it into ...
+
+    而配置档里的 `custom_system_prompt` 只在 BabelDOC 自己的 PDF 流水线
+    （`il_translator_llm_only._build_llm_prompt`）里才被用上，术语表同理。
+    结果是：arXiv 直译**静默丢掉了用户写好的翻译规范、术语表**，连我们要求的
+    `[[M12]]` 占位符原样保留规则都没告诉模型。
+
+    这里在实例上覆写 `prompt()`（`do_translate` 走的就是 `self.prompt`），
+    同时刷新缓存影响参数——提示词变了必须让旧缓存失效，否则会命中"没有规范/术语"
+    的旧译文。返回是否真的改写了提示词。
+
+    术语表放进 **system** 消息（不是 user）：BabelDOC 的 user 模板写着
+    "Treat next line as plain text input"，把术语表塞进 user 有被当成待翻译正文的风险。
+    """
+    system = tex_translate.system_prompt_for(
+        lang_out, getattr(profile, "custom_system_prompt", None))
+    pairs = [(e.get("source"), e.get("target")) for e in (glossary_entries or [])
+             if e.get("source") and e.get("target")]
+    if pairs:
+        system += (
+            "\n\n术语对照表（左侧术语必须使用右侧译法，不得改译，也不要把这张表当正文输出）：\n"
+            + "\n".join(f"- {s} → {t}" for s, t in pairs)
+        )
+
+    base_prompt = translator.prompt
+
+    def prompt(text: str):
+        messages = base_prompt(text)
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system
+        return messages
+
+    translator.prompt = prompt  # 实例属性覆盖绑定方法
+    try:
+        # 缓存键要跟着提示词/术语走，否则会命中旧提示词产出的译文
+        translator.add_cache_impact_parameters("prompt", system)
+        if pairs:
+            translator.add_cache_impact_parameters(
+                "yiyue_glossary", "|".join(f"{s}={t}" for s, t in pairs))
+    except Exception:  # noqa: BLE001
+        logger.warning("刷新翻译缓存影响参数失败（忽略）", exc_info=True)
+    return True
 
 
 def preflight(translator) -> None:

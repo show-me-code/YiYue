@@ -313,6 +313,25 @@ _LANG_NAMES = {"zh": "Simplified Chinese", "zt": "Traditional Chinese",
                "en": "English", "ja": "Japanese"}
 
 
+def lang_display_name(lang_out: str) -> str:
+    """目标语言的英文名（写进提示词用）。"""
+    return _LANG_NAMES.get((lang_out or "").strip().lower(), "Simplified Chinese")
+
+
+def system_prompt_for(lang_out: str, custom: str | None = None) -> str:
+    """组装送给模型的总提示词：配置档自定义规范（若有）+ 占位符/结构规则。
+
+    为什么必须显式送：arXiv 路径直接调 `translator.translate()`，BabelDOC 在
+    `do_translate` 里用的是**写死的极简提示词**（"You are a professional,authentic
+    machine translation engine."）——配置档里的自定义翻译规范、术语表、以及
+    下面这套占位符规则全都不会到达模型。模型不知道 `[[M12]]` 必须原样保留，
+    只能靠事后校验 + 绕缓存重试兜住（实测确实会被拒回）。
+    """
+    rules = SYSTEM_PROMPT.replace("{lang_out_name}", lang_display_name(lang_out))
+    custom = (custom or "").strip()
+    return (custom + "\n\n" + rules) if custom else rules
+
+
 def _integrity_ok(src: str, dst: str) -> bool:
     r"""校验译文块未破坏 LaTeX 结构。
 
