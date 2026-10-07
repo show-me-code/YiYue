@@ -1,7 +1,12 @@
-"""任务输出文件服务：支持 Range 请求（pdf.js 必需）。"""
+"""任务输出文件服务。
 
-import os
-import re
+Range 支持由 Starlette 的 FileResponse 原生实现（单段/多段、If-Range、
+416 Range Not Satisfiable、Accept-Ranges 都会自动处理）。这里**不要**再读
+`Range` 头自己拼 206：之前的写法是把 Range 绑成了查询参数
+（`range: str | None = None` 在 FastAPI 里是 query 参数，不是请求头），
+那段分支永远不会执行；自己实现还会丢掉多段 Range 与 If-Range。
+"""
+
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,8 +19,6 @@ from app.models import TaskOutput
 
 router = APIRouter(prefix="/api/tasks", tags=["files"])
 
-RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)$")
-
 
 def _safe_path(path: str) -> Path:
     p = Path(path).resolve()
@@ -25,8 +28,7 @@ def _safe_path(path: str) -> Path:
 
 
 @router.get("/{task_id}/files/{kind}")
-def get_file(task_id: int, kind: str, range: str | None = None,
-             s: Session = Depends(get_session)):
+def get_file(task_id: int, kind: str, s: Session = Depends(get_session)):
     if kind not in ("original", "mono", "dual"):
         raise HTTPException(404, "未知的文件类型")
     row = s.exec(
@@ -40,32 +42,13 @@ def get_file(task_id: int, kind: str, range: str | None = None,
     if not path.exists():
         raise HTTPException(404, "文件不存在")
 
-    size = os.path.getsize(path)
-    filename = path.name
-    common_headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Disposition": f'inline; filename="{filename}"',
-        # 同一个 URL 下的 PDF 会被"重试/重跑"整体替换，浏览器与 pdf.js 一旦
-        # 按启发式缓存就会一直显示旧文件（实测刷新后仍是旧译文）。
-        "Cache-Control": "no-store",
-    }
-
-    if range:
-        m = RANGE_RE.match(range.strip())
-        if not m:
-            raise HTTPException(416, "Range 格式无效")
-        start_s, end_s = m.groups()
-        start = int(start_s) if start_s else 0
-        end = int(end_s) if end_s else size - 1
-        end = min(end, size - 1)
-        if start > end or start >= size:
-            raise HTTPException(416, "Range 越界")
-        length = end - start + 1
-        return FileResponse(
-            path, media_type="application/pdf", status_code=206,
-            headers={**common_headers,
-                     "Content-Range": f"bytes {start}-{end}/{size}",
-                     "Content-Length": str(length)},
-        )
-    return FileResponse(path, media_type="application/pdf",
-                        headers={**common_headers, "Content-Length": str(size)})
+    return FileResponse(
+        path, media_type="application/pdf",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{path.name}"',
+            # 同一个 URL 下的 PDF 会被"重试/重跑"整体替换，浏览器与 pdf.js 一旦
+            # 按启发式缓存就会一直显示旧文件（实测刷新后仍是旧译文）。
+            "Cache-Control": "no-store",
+        },
+    )

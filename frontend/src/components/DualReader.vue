@@ -26,6 +26,8 @@ const syncing = ref(false)
 
 const leftPane = ref<InstanceType<typeof PdfPane> | null>(null)
 const rightPane = ref<InstanceType<typeof PdfPane> | null>(null)
+/** reload 后要跳回的页；等 PdfPane 真正载入完成再跳，不用猜时间 */
+let pendingRestore: number | null = null
 
 const rightUrl = computed(() => props.monoUrl)
 const displayPage = computed(() => Math.min(rightPage.value, Math.max(1, props.pagesDone)))
@@ -54,11 +56,21 @@ function zoomIn() { zoom.value = Math.min(3, Math.round((zoom.value + 0.1) * 10)
 function zoomOut() { zoom.value = Math.max(0.4, Math.round((zoom.value - 0.1) * 10) / 10) }
 function resetZoom() { zoom.value = 1 }
 
+function onRightLoaded(n: number) {
+  rightTotal.value = n
+  if (pendingRestore !== null) {
+    // 用 'loaded' 事件而不是固定 setTimeout(600)：合并大文件时 PDF 可能要几秒，
+    // 固定延时既可能太早（节点还没建好，跳页失效）也可能太晚。
+    const target = Math.min(pendingRestore, Math.max(1, n))
+    pendingRestore = null
+    rightPane.value?.goToPage(target)
+  }
+}
+
 watch(() => props.reloadKey, () => {
   // 增量合并后重载译文文档，尽量停留在当前阅读页
-  const target = rightPage.value
+  pendingRestore = rightPage.value
   rightPane.value?.reload()
-  setTimeout(() => rightPane.value?.goToPage(target), 600)
 })
 </script>
 
@@ -99,7 +111,7 @@ watch(() => props.reloadKey, () => {
         :zoom="zoom"
         :expected-total="expectedTotal"
         @page-change="fromRight"
-        @loaded="(n: number) => (rightTotal = n)"
+        @loaded="onRightLoaded"
       />
     </div>
   </div>

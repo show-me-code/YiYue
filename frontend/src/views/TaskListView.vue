@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, genFileId } from 'element-plus'
+import type { UploadInstance, UploadRawFile } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
 import { api, type Profile, type Task, type UploadOptions } from '../api/client'
 
 const router = useRouter()
+const uploadRef = ref<UploadInstance>()
 
 const profiles = ref<Profile[]>([])
 const tasks = ref<Task[]>([])
@@ -60,6 +62,16 @@ function onFileChange(files: File[]) {
   fileList.value = files.slice(0, 1)
 }
 
+/** limit=1 时再选一个文件会触发 on-exceed；不处理就"点了没反应"。直接换成新文件。 */
+function onExceed(files: File[]) {
+  const raw = files[0] as UploadRawFile | undefined
+  if (!raw) return
+  uploadRef.value?.clearFiles()
+  raw.uid = genFileId()
+  uploadRef.value?.handleStart(raw)
+  onFileChange([raw])
+}
+
 async function submit() {
   if (!fileList.value.length && !form.arxiv_id.trim()) {
     ElMessage.warning('请上传 PDF 文件，或填写 arXiv ID（二选一即可）')
@@ -98,11 +110,13 @@ function progressPct(t: Task): number {
     <div class="card">
       <h3 style="margin-top:0">新建翻译任务</h3>
       <el-upload
+        ref="uploadRef"
         drag
         :auto-upload="false"
         :limit="1"
         :on-change="(f: any) => onFileChange([f.raw])"
         :on-remove="() => onFileChange([])"
+        :on-exceed="onExceed"
         :show-file-list="true"
         accept="application/pdf"
       >

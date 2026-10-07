@@ -125,9 +125,12 @@ def test_profile(profile_id: int, s: Session = Depends(get_session)):
     protocol = getattr(p, "protocol", "openai") or "openai"
     ok, detail = _probe(p, protocol)
     result: dict = {"ok": ok, "detail": detail, "protocol": protocol}
-    if not ok:
+    # 仅在用户填了自定义端点时才跨协议再探一次：那种端点（one-api 之类网关）
+    # 通常两种协议都支持。base_url 为空时"另一种协议"会落到**另一家厂商的官方
+    # 端点**，等于把用户的 API key 发给了它，还会给出误导性的"可切换"建议。
+    if not ok and (p.base_url or "").strip():
         other = "anthropic" if protocol == "openai" else "openai"
-        other_ok, other_detail = _probe(p, other)
+        other_ok, _other_detail = _probe(p, other)
         if other_ok:
             result["suggest_protocol"] = other
             result["detail"] = (

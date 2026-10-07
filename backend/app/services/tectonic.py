@@ -74,7 +74,8 @@ def compile_tex(main_tex: Path, out_dir: Path, timeout_s: int = 900) -> Path:
             log_text = log_file.read_text("utf-8", errors="replace") if log_file.exists() else ""
             if attempt == 0:
                 repaired = tex_translate.repair_from_log(
-                    main_tex.read_text("utf-8", errors="replace"), log_text
+                    main_tex.read_text("utf-8", errors="replace"), log_text,
+                    src_root=main_tex.parent,
                 )
                 if repaired is not None:
                     logger.info("applying compile repair and retrying")

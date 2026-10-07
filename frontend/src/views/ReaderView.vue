@@ -39,6 +39,11 @@ function applyTask(t: Task) {
   }
 }
 
+function closeEvents() {
+  source?.close()
+  source = null
+}
+
 onMounted(async () => {
   try {
     applyTask(await api.getTask(taskId))
@@ -46,6 +51,7 @@ onMounted(async () => {
     ElMessage.error((e as Error).message)
     return
   }
+  if (!live.value) return  // 任务已结束（读历史任务）就不用开事件流
   source = openTaskEvents(taskId, (ev) => {
     const type = ev.type as string
     if (type === 'state' && ev.task) applyTask(ev.task as Task)
@@ -58,16 +64,28 @@ onMounted(async () => {
       pagesDone.value = Number(ev.pages_done ?? 0)
       reloadKey.value++
     } else if (type === 'done') {
+      // 终态必须主动关闭：服务端生成器到此结束，EventSource 会不停自动重连，
+      // 每次重连都白占一条 SSE 连接 + 一个订阅队列。
+      closeEvents()
       api.getTask(taskId).then(applyTask).catch(() => {})
       reloadKey.value++
       ElMessage.success('翻译完成')
+    } else if (type === 'cancelled') {
+      closeEvents()
+      api.getTask(taskId).then(applyTask).catch(() => {})
+      ElMessage.info('任务已取消')
     } else if (type === 'error') {
+      closeEvents()
       ElMessage.error(String(ev.message ?? '翻译失败'))
     }
   })
+  source.onerror = () => {
+    // 断线且任务已不在进行中：不再让浏览器自动重连
+    if (!live.value) closeEvents()
+  }
 })
 
-onBeforeUnmount(() => source?.close())
+onBeforeUnmount(closeEvents)
 </script>
 
 <template>

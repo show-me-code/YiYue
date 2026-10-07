@@ -133,6 +133,16 @@ def overflow_pt(ink: pymupdf.Rect, area: pymupdf.Rect) -> float:
                area.y0 - ink.y0, ink.y1 - area.y1)
 
 
+def new_overflow_pages(overflow_t: list[int], overflow_b: list[int]) -> list[int]:
+    """译文里超版心的页，去掉基线本来就超版心的页。
+
+    按**页集合**取差，而不是比长度：译文 2 页超版心、基线也是 2 页但页码
+    完全不同时，比长度会得出"没有新增"的结论，真正的溢出被静默放过。
+    """
+    base = set(overflow_b)
+    return [p for p in overflow_t if p not in base]
+
+
 def spacing_profile(doc: pymupdf.Document) -> dict:
     """行距画像：段内行距众数与一致性、段间基线距离。
 
@@ -254,7 +264,7 @@ def verify_translation(
     if area is not None:
         overflow_b = [i + 1 for i, b in enumerate(boxes_b)
                       if b is not None and overflow_pt(b, area) > tol]
-    new_overflow = overflow_t if len(overflow_t) > len(overflow_b) else []
+    new_overflow = new_overflow_pages(overflow_t, overflow_b)
 
     # 存疑页放大对照（新增溢出页优先，其次版心偏差最大的页）
     zoom_pages = sorted(set(overflow_t) | {i + 1 for _, i in
@@ -352,9 +362,12 @@ def verify_translation(
     if n_t != n_b:
         notes.append(f"页数与基线不同（译文 {n_t} / 基线 {n_b}）：中文更紧凑属正常，"
                      "逐页对照仅在内容对齐的页面上有效")
-    if overflow_b and len(overflow_t) <= len(overflow_b):
+    if overflow_b and not new_overflow:
         notes.append(f"基线第 {overflow_b} 页同样超出理论版心：属作者原版瑕疵，"
                      "按忠实原则保留，未去「修好」")
+    elif overflow_b and new_overflow:
+        notes.append(f"基线第 {overflow_b} 页本身超出理论版心（作者原版瑕疵）；"
+                     f"译文另有第 {new_overflow} 页为新增溢出，需目检")
     if delta_pages:
         top = ", ".join(f"p{i + 1}({d:.0f}pt)" for d, i in
                         sorted(delta_pages, reverse=True)[:ZOOM_MAX_PAGES])

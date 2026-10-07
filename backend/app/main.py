@@ -37,9 +37,15 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="译阅 YiYue", version="0.1.0", lifespan=lifespan)
+    # 只允许本机页面跨源访问。原来是 allow_origins=["*"] 且无鉴权：任意网页
+    # 都能读取本机 127.0.0.1:8000 的任务/输出（翻译结果、原始论文），还能改配置档。
+    # 前端与后端同源（生产由本服务托管 dist，开发走 Vite 代理），
+    # 所以只需放行本机来源。
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origin_regex=(
+            r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
+        ),
         allow_methods=["*"],
         allow_headers=["*"],
     )

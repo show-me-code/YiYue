@@ -11,6 +11,8 @@ import re
 from fractions import Fraction
 from pathlib import Path
 
+from app.services import textio
+
 logger = logging.getLogger(__name__)
 
 CHUNK_CHARS = 2500
@@ -26,6 +28,9 @@ _PROTECT_ENVS = [
 ]
 
 _PLACEHOLDER_RE = re.compile(r"\[\[\s*([MC])\s*(\d+)\s*\]\]")
+# 只认 M 命名空间：protected 列表只属于 M；[[C#]] 是图注/标题占位符，
+# 由 put_caps 单独替换（见 _restore 的说明）。
+_PLACEHOLDER_M_RE = re.compile(r"\[\[\s*M\s*(\d+)\s*\]\]")
 
 # 需要单独成块翻译的标题类命令
 _TITLE_CMDS = ("caption", "captionof", "subcaption", "title")
@@ -74,14 +79,21 @@ def _match_bracketed(text: str, pos: int) -> tuple[str, int] | None:
     return None
 
 
+_CAPTION_TOKEN_RE = re.compile(r"\[\[\s*C\s*(\d+)\s*\]\]")
+
+
 def _extract_translatable_blocks(text: str, prefix: str = "C",
                                  cmds: tuple[str, ...] = _TITLE_CMDS,
+                                 start_index: int = 0,
                                  ) -> tuple[str, list[str]]:
     r"""把 \caption / \captionof / \title 的内容抽成 [[C#]] 占位符，待单独翻译。
 
     用花括号配平解析而不是正则：图注里常有 \textbf{a \emph{b}} 这类嵌套，
     也有 \captionof{figure}{...}（caption 宏包）——正则版本会把它们整条漏掉，
     表现为图注静默保留英文。
+
+    start_index 让调用方把多段抽取（正文图注、导言区标题）编进**同一个编号空间**：
+    两段各自从 [[C0]] 起编号会互相覆盖，实测 \title 会被第一个图注顶掉。
     """
     collected: list[str] = []
     out: list[str] = []
@@ -121,16 +133,12 @@ def _extract_translatable_blocks(text: str, prefix: str = "C",
         if not content.strip():
             continue
         out.append(text[last:j + 1])
-        out.append(f"[[{prefix}{len(collected)}]]")
+        out.append(f"[[{prefix}{len(collected) + start_index}]]")
         collected.append(content)
         last = end  # 右花括号留给下一段
         continue
     out.append(text[last:])
     return "".join(out), collected
-
-
-def _restore_all(text: str, protected: list[str]) -> str:
-    return _restore(text, protected)
 
 
 def _build_protection(tex: str) -> tuple[str, list[str]]:
@@ -156,6 +164,9 @@ def _build_protection(tex: str) -> tuple[str, list[str]]:
     out = re.sub(r"(?s)\$\$(.*?)\$\$", lambda m: protect(m.group(0)), out)
 
     # 3) 不可翻译命令（含可选参数与花括号参数，支持一层嵌套）
+    #    命令名后用 (?![A-Za-z]) 而不是 \b：\b 在 `\citep*` 的 `*` 之后不成立，
+    #    正则会退回去只匹配 `\citep`，星号被 [^{}\s%]* 吃掉、后面的 {key} 就留在
+    #    正文里被当成散文翻译（引用键被改坏）。
     cmd_names = (
         r"cite[tp]?\*?|ref|eqref|autoref|Cref|label|url|href|bibliographystyle|"
         r"bibliography|includegraphics\*?|input|include|usepackage|"
@@ -164,7 +175,7 @@ def _build_protection(tex: str) -> tuple[str, list[str]]:
         r"captionsetup|hspace\*?|vspace\*?|includeonly|tikzset|pgfplotsset"
     )
     out = re.sub(
-        r"\\(?:" + cmd_names + r")\b(?:\[[^\]]*\])*(?:\{[^{}]*\}|[^{}\s%]*)",
+        r"\\(?:" + cmd_names + r")(?![A-Za-z])(?:\[[^\]]*\])*(?:\{[^{}]*\}|[^{}\s%]*)",
         lambda m: protect(m.group(0)),
         out,
     )
@@ -192,19 +203,35 @@ def _build_protection(tex: str) -> tuple[str, list[str]]:
 
 
 def _restore(text: str, protected: list[str]) -> str:
-    """把 [[M#]] / [[C#]] / [[ M# ]] 恢复为原片段。
+    r"""把 [[M#]] 恢复为原片段（只处理 M 命名空间）。
 
-    只替换占位符本身，**绝不吞掉两侧的花括号**：源码里 `\\hbox{[[M2]]}`
-    的花括号是真实 LaTeX 语法，随手一起替换会产出 `\\hbox$x$` 这种
-    "Missing { inserted." 的坏文件（实测导致整节编译失败并退回英文原文）。
+    三条硬约束，每条都踩过坑：
+
+    1. 只替换占位符本身，**绝不吞掉两侧的花括号**：源码里 `\hbox{[[M2]]}`
+       的花括号是真实 LaTeX 语法，随手一起替换会产出 `\hbox$x$` 这种
+       "Missing { inserted." 的坏文件（实测导致整节编译失败并退回英文原文）。
+    2. **迭代到不再变化**：保护是分步做的，后面的步骤会把已含占位符的文本再包一层
+       （注释行整行受保护时，行内 `\citep{key}` 先变成 [[M0]]，整行又变成 [[M1]]，
+       而 M1 的内容就是 "% [[M0]]"）。单遍替换会把内层 [[M0]] 原样留在成品里——
+       实测 appendix.tex/experiments.tex 里就有几十处。
+    3. **不能碰 [[C#]]**：`protected` 是 M 列表，用下标去查 C 占位符会命中**完全
+       无关**的受保护片段。迭代展开把这个问题从"恰好没触发"变成必然：实测
+       `\caption{[[C7]]}` 被换成了一整段 `\begin{equation*}…\end{figure}`，
+       编译报 `File ended while scanning use of \caption@ydblarg`，整篇回退。
+       C 占位符留给后面的 put_caps。
     """
     def sub(m: re.Match) -> str:
-        idx = int(m.group(2))  # group(1) 是 M/C 标记，group(2) 才是序号
+        idx = int(m.group(1))
         if 0 <= idx < len(protected):
             return protected[idx]
         return m.group(0)
 
-    return _PLACEHOLDER_RE.sub(sub, text)
+    for _ in range(12):  # 深度上限：坏数据造成的自引用不至于死循环
+        new = _PLACEHOLDER_M_RE.sub(sub, text)
+        if new == text:
+            return text
+        text = new
+    return text
 
 
 def _structure_counts(text: str) -> tuple[int, int, int]:
@@ -246,7 +273,7 @@ _LANG_NAMES = {"zh": "Simplified Chinese", "zt": "Traditional Chinese",
 
 
 def _integrity_ok(src: str, dst: str) -> bool:
-    """校验译文块未破坏 LaTeX 结构。
+    r"""校验译文块未破坏 LaTeX 结构。
 
     - 全局：花括号与 $ 总数一致；
     - 占位符邻位：源文中紧贴占位符的 { 和 } 必须在译文中原位保留
@@ -334,7 +361,10 @@ def _translate_english_titles(text: str, translator, stats: dict | None) -> str:
 
     if stats is not None:
         stats["labels_retranslated"] = stats.get("labels_retranslated", 0) + len(edits)
-    for start, stop, new in reversed(edits):
+    # 必须按起始位置**从后往前**改：edits 里章节标题先收集、子图注后收集，
+    # 直接 reversed() 只是把收集顺序倒过来，并不等于位置倒序，前面的改动会把
+    # 后面记录的偏移量顶偏，替换到错误位置。
+    for start, stop, new in sorted(edits, key=lambda e: e[0], reverse=True):
         text = text[:start] + new + text[stop:]
     return text
 
@@ -418,7 +448,10 @@ def translate_tex(
     # 1) 抽出 caption / captionof / subcaption / subfloat / title 内容（含 preamble 中的 title）
     body, body_caps = _extract_translatable_blocks(
         body, "C", ("caption", "captionof", "subcaption", "subfloat"))
-    preamble, pre_caps = _extract_translatable_blocks(preamble, "C", ("title",))
+    # 导言区的 \title 接在正文图注之后编号：两段各自从 0 起会撞号，
+    # 实测 put_caps 会把 \title 的位置替换成正文第一个图注（标题被静默吃掉）。
+    preamble, pre_caps = _extract_translatable_blocks(
+        preamble, "C", ("title",), start_index=len(body_caps))
     all_caps = body_caps + pre_caps
 
     # 2) 命令/数学/环境保护
@@ -474,9 +507,12 @@ def translate_tex(
                         len(chunks) + len(all_caps))
 
     def put_caps(text: str) -> str:
-        for j, cap in enumerate(all_caps):
-            text = text.replace(f"[[C{j}]]", cap)
-        return text
+        # 用正则容忍 LLM 写出的 [[C 4]] / [[ C4 ]] 这类变体，否则会把
+        # 占位符原样留在成品 PDF 里（纯文本替换只认 [[C4]] 这种精确写法）
+        def sub(m: re.Match) -> str:
+            idx = int(m.group(1))
+            return all_caps[idx] if 0 <= idx < len(all_caps) else m.group(0)
+        return _CAPTION_TOKEN_RE.sub(sub, text)
 
     new_body = put_caps(new_body)
     preamble = put_caps(preamble)
@@ -498,22 +534,67 @@ _SUBFIGURE_SHIM = (
 )
 
 
-def repair_from_log(tex: str, log_text: str) -> str | None:
+# xcolor 被显式带选项加载的写法（选项要与后面那次加载完全一致才能消除冲突）
+_XCOLOR_USE_RE = re.compile(r"\\usepackage\[([^\]]*)\]\{xcolor\}")
+# 日志里点名了冲突发生在哪个文件的第几行：优先从那个文件取选项
+_XCOLOR_CLASH_LOG_RE = re.compile(
+    r"([\w./\\ -]+?):\d+: LaTeX Error: Option clash for package xcolor")
+
+
+def _xcolor_options(log_text: str, tex: str, src_root: Path | None) -> str:
+    """找出作者给 xcolor 指定的选项（修复必须用同一组，否则仍然冲突）。"""
+    candidates: list[Path] = []
+    if src_root:
+        m = _XCOLOR_CLASH_LOG_RE.search(log_text)
+        if m:
+            stem = Path(m.group(1).strip()).name
+            candidates += [p for p in src_root.rglob(f"{stem}*") if p.is_file()]
+        candidates += sorted(src_root.rglob("*.tex"))
+        candidates += sorted(src_root.rglob("*.sty"))
+    for f in candidates:
+        try:
+            mm = _XCOLOR_USE_RE.search(textio.load_text(f))
+        except OSError:
+            continue
+        if mm and mm.group(1).strip():
+            return mm.group(1).strip()
+    mm = _XCOLOR_USE_RE.search(tex)
+    return mm.group(1).strip() if mm else ""
+
+
+def repair_from_log(tex: str, log_text: str,
+                    src_root: Path | None = None) -> str | None:
     """根据编译日志对主 tex 做针对性修复；无已知修复点返回 None。
 
-    subfigure 环境未定义（源码用了 subcaption 的环境却只装了冲突的 subfig
-    宏包——arXiv 上不少论文带这种隐患）：不能用 subcaption 修补（与 subfig
-    冲突），改用 minipage 垫片模拟 subfigure 环境。
+    两类修复：
+
+    1. **subfigure 环境未定义**（源码用了 subcaption 的环境却只装了冲突的 subfig
+       宏包——arXiv 上不少论文带这种隐患）：不能用 subcaption 修补（与 subfig
+       冲突），改用 minipage 垫片模拟 subfigure 环境，插在 \\documentclass 之后。
+    2. **xcolor 选项冲突**：源码先由某个 .sty（经 eso-pic）**无选项**加载 xcolor，
+       之后又写 `\\usepackage[table,dvipsnames]{xcolor}`，在旧版 LaTeX（Tectonic 内置
+       的是 2021 版；作者 00README.json 指定的是 TeX Live 2025 + pdflatex）下直接
+       报 `Option clash for package xcolor`，**源码本身就无法编译**（实测原始源码
+       不加任何处理也是这个错）。用 `\\PassOptionsToPackage` 把作者自己写的那组选项
+       提前到最早的加载点，冲突消失且作者要的 `table`/`dvipsnames` 功能照旧。
     """
-    inject = ""
-    if "Environment subfigure undefined" in log_text and "newenvironment{subfigure}" not in tex:
-        inject = _SUBFIGURE_SHIM
-    if not inject:
+    before = ""   # 必须放在 \documentclass 之前
+    after = ""    # 必须放在 \documentclass 之后
+    if ("Option clash for package xcolor" in log_text
+            and "PassOptionsToPackage" not in tex):
+        opts = _xcolor_options(log_text, tex, src_root)
+        if opts:
+            before = f"\\PassOptionsToPackage{{{opts}}}{{xcolor}}\n"
+    if ("Environment subfigure undefined" in log_text
+            and "newenvironment{subfigure}" not in tex):
+        after = _SUBFIGURE_SHIM
+    if not before and not after:
         return None
     m = re.search(r"(?m)^(\\documentclass(?:\[[^\]]*\])?\{[^{}]*\}[^\n]*)$", tex)
     if not m:
         return None
-    return tex[:m.end()] + "\n" + inject + tex[m.end():]
+    tail = ("\n" + after) if after else ""
+    return tex[:m.start()] + before + tex[m.start():m.end()] + tail + tex[m.end():]
 
 
 # ---- 预处理：字体与 XeTeX 兼容 ----
@@ -537,15 +618,53 @@ _CTEX_STRETCH_KEEP = (
     + _CTEX_LINE +
     "\\linespread{\\yiyuespread}\\selectfont\n"
 )
-_LABEL_LOCALIZE = (
-    "\\providecommand\\figurename{}\\providecommand\\tablename{}"
-    "\\providecommand\\refname{}\\providecommand\\abstractname{}"
-    "\\providecommand\\keywordsname{}\\providecommand\\appendixname{}"
-    "\\providecommand\\equationname{}\\providecommand\\sectionname{}%\n"
-    "\\renewcommand\\figurename{图}\\renewcommand\\tablename{表}"
-    "\\renewcommand\\refname{参考文献}\\renewcommand\\abstractname{摘要}"
-    "\\renewcommand\\keywordsname{关键词}\\renewcommand\\appendixname{附录}%\n"
-)
+# 自动标签的简/繁两套写法：繁体任务下把「图/参考文献」写成简体是明显的疏漏
+_LOCALIZE_WORDS = {
+    "zh": {"figure": "图", "table": "表", "ref": "参考文献", "abstract": "摘要",
+           "keywords": "关键词", "appendix": "附录"},
+    "zt": {"figure": "圖", "table": "表", "ref": "參考文獻", "abstract": "摘要",
+           "keywords": "關鍵詞", "appendix": "附錄"},
+}
+
+
+def _lang_family(lang_out: str) -> str:
+    """把 zh-CN / zh_CN / zt 之类规整成 zh / zt / 其它。"""
+    lang = (lang_out or "").strip().lower().replace("_", "-")
+    return lang.split("-")[0]
+
+
+def needs_ctex(lang_out: str) -> bool:
+    """目标语言是否需要 ctex（简/繁中文）。"""
+    return _lang_family(lang_out) in ("zh", "zt")
+
+
+def _localize_words(lang_out: str) -> dict:
+    return _LOCALIZE_WORDS["zt" if _lang_family(lang_out) == "zt" else "zh"]
+
+
+def label_localize(lang_out: str) -> str:
+    """按目标语言生成自动标签汉化块（简/繁）。
+
+    用字符串拼接而不是 %-格式化：模板里的 `%\\n`（防止行尾空格被 TeX 吃掉）
+    会被当成格式化占位符。
+    """
+    w = _localize_words(lang_out)
+    return (
+        "\\providecommand\\figurename{}\\providecommand\\tablename{}"
+        "\\providecommand\\refname{}\\providecommand\\abstractname{}"
+        "\\providecommand\\keywordsname{}\\providecommand\\appendixname{}"
+        "\\providecommand\\equationname{}\\providecommand\\sectionname{}%\n"
+        "\\renewcommand\\figurename{" + w["figure"] + "}"
+        "\\renewcommand\\tablename{" + w["table"] + "}"
+        "\\renewcommand\\refname{" + w["ref"] + "}"
+        "\\renewcommand\\abstractname{" + w["abstract"] + "}"
+        "\\renewcommand\\keywordsname{" + w["keywords"] + "}"
+        "\\renewcommand\\appendixname{" + w["appendix"] + "}%\n"
+    )
+
+
+# 向后兼容：默认简体块
+_LABEL_LOCALIZE = label_localize("zh")
 
 
 def prepare_for_xetex(tex: str, lang_out: str = "zh", line_spread: float = 1.0) -> str:
@@ -553,17 +672,19 @@ def prepare_for_xetex(tex: str, lang_out: str = "zh", line_spread: float = 1.0) 
 
     - 用 ctex 宏包（Fandol 字体集）处理中文断行、标点禁则、中西文间距，
       叠加在原样式之上；不依赖系统字体（Fandol 随 TeX 发行版分发）；
+      **简体（zh）与繁体（zt）都要注入**——繁体也是中文，之前只认 zh 前缀，
+      zt 任务完全不注 ctex（中文没有断行与禁则支持）；
     - **行距可调**：line_spread=1.0 与原文一致；中文排版惯例约 1.3（默认由任务选项传入）。
       实现为「文档原本的 \\baselinestretch × line_spread」，不会把作者自己的行距设置抹掉；
     - 移除 XeTeX 下冲突的 inputenc/fontenc；
-    - 汉化自动标签：图/表/参考文献/附录/摘要等，且放在导言区末尾执行，
+    - 汉化自动标签：图/表/参考文献/附录/摘要等（简繁各自用字），且放在导言区末尾执行，
       不会被作者自己的 \\renewcommand 覆盖。
     样式文件里硬编码的 "Abstract" 由 patch_style_files 单独处理。
     """
     out = tex
     out = re.sub(r"(?m)^\\usepackage\[(?:[^\]]*)\]\{inputenc\}.*\n?", "", out)
     out = re.sub(r"(?m)^\\usepackage\[(?:[^\]]*)\]\{fontenc\}.*\n?", "", out)
-    if not lang_out.startswith("zh") or "\\documentclass" not in out:
+    if not needs_ctex(lang_out) or "\\documentclass" not in out:
         return out
     spread = max(1.0, min(float(line_spread or 1.0), 2.0))
     num, den = Fraction(spread).limit_denominator(100).as_integer_ratio()
@@ -575,9 +696,11 @@ def prepare_for_xetex(tex: str, lang_out: str = "zh", line_spread: float = 1.0) 
             count=1,
         )
     # 汉化块：插在 \begin{document} 之前（导言区最后），作者的重定义已经执行完
-    if "\\renewcommand\\figurename{图}" not in out and "\\begin{document}" in out:
-        out = out.replace("\\begin{document}",
-                          _LABEL_LOCALIZE + "\\begin{document}", 1)
+    if "\\begin{document}" in out:
+        marker = "\\renewcommand\\figurename{%s}" % _localize_words(lang_out)["figure"]
+        if marker not in out:
+            out = out.replace("\\begin{document}",
+                              label_localize(lang_out) + "\\begin{document}", 1)
     return out
 
 
@@ -597,7 +720,8 @@ def patch_style_files(src_root: Path) -> int:
     for pattern in ("*.sty", "*.cls"):
         for f in src_root.rglob(pattern):
             try:
-                text = f.read_text("utf-8", errors="replace")
+                # 无损读取：errors="replace" 得到的 U+FFFD 会随写回固化进样式文件
+                text = textio.load_text(f)
             except OSError:
                 continue
             if "Abstract" not in text:

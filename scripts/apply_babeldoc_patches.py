@@ -12,9 +12,42 @@
 import sys
 from pathlib import Path
 
-SITE = Path(__file__).resolve().parents[1] / "backend" / ".venv" / "Lib" / "site-packages" / "babeldoc"
 
-# (文件, [旧串必须唯一且存在 → 新串]) ；旧串取自 0.6.4 实际源码
+def _locate_babeldoc() -> Path:
+    """定位已安装的 babeldoc 包目录。
+
+    不再硬编码 backend/.venv/Lib/site-packages（只对 Windows + 该 venv 布局成立；
+    POSIX 是 lib/pythonX.Y/site-packages）。优先问当前解释器，因为启动器就是用
+    项目 venv 的 python 调本脚本的。
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("babeldoc")
+    except (ImportError, ValueError):
+        spec = None
+    if spec and spec.submodule_search_locations:
+        return Path(next(iter(spec.submodule_search_locations)))
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [root / "backend" / ".venv" / "Lib" / "site-packages" / "babeldoc"]
+    candidates += sorted(
+        (root / "backend" / ".venv" / "lib").glob("python*/site-packages/babeldoc")
+    )
+    for c in candidates:
+        if c.exists():
+            return c
+    raise SystemExit(
+        "找不到 babeldoc 包：请先在 backend/.venv 中安装依赖"
+        "（cd backend && uv sync），再重跑本脚本。"
+    )
+
+
+# 注意：babeldoc 目录在 main() 里惰性定位，这样本模块可以被测试直接导入
+# （不需要环境里已装 babeldoc）来校验下面的补丁表本身。
+# (文件, [(旧串必须唯一且存在 → 新串, 幂等标记)])；旧串取自 0.6.4 实际源码。
+# 幂等标记是**新串里独有**的一段文字。不能靠"新串在、旧串不在"判断：插入型补丁
+# （把新方法插在旧锚点前）应用后旧串依然存在，重跑会再插一遍，文件每次启动都变长。
 PATCHES = [
     (
         "format/pdf/document_il/midend/paragraph_finder.py",
@@ -35,6 +68,7 @@ PATCHES = [
             if y2 > y1:
                 return y1, y2
         return visual_box.y, visual_box.y2''',
+                "if pdf_box is not None and calculate_iou_for_boxes",
             ),
             # --- PR #617: 合并垂直包含的段落（新方法，插在 fix_overlapping_paragraphs 前）---
             (
@@ -116,6 +150,7 @@ PATCHES = [
     def fix_overlapping_paragraphs(self, page: Page):
         """
         Adjusts the bounding boxes of paragraphs on a page to resolve vertical overlaps.''',
+                "_try_merge_contained_paragraphs",
             ),
             # --- PR #617: 循环内调用合并 ---
             (
@@ -157,6 +192,7 @@ PATCHES = [
                                 paragraphs_mutated = True
                                 break
                             continue''',
+                "paragraphs_mutated = True",
             ),
             # --- PR #617: 循环初始化 ---
             (
@@ -171,6 +207,7 @@ PATCHES = [
             paragraphs_mutated = False
 
             for i in range(len(paragraphs)):''',
+                "paragraphs_mutated = False",
             ),
             # --- 本地修复：孤儿片段重分配（新方法）---
             (
@@ -284,6 +321,7 @@ PATCHES = [
             )
 
     def fix_overlapping_paragraphs(self, page: Page):''',
+                "def _redistribute_orphan_fragments",
             ),
             # --- 本地修复：在 process_page 末尾调用 ---
             (
@@ -298,6 +336,7 @@ PATCHES = [
 
         for paragraph in paragraphs:
             self.update_paragraph_data(paragraph, update_unicode=True)''',
+                "self._redistribute_orphan_fragments(page)",
             ),
         ],
     ),
@@ -315,6 +354,7 @@ PATCHES = [
             -x["iou"],
         )
     )''',
+                '0 if x["iou"] >= 0.5 else 1',
             ),
         ],
     ),
@@ -322,8 +362,9 @@ PATCHES = [
 
 
 def main() -> None:
+    site = _locate_babeldoc()
     # "area" 字段是 618 排序键需要的，先确认字典构造处已包含；没有则一并补上
-    layout_file = SITE / "format/pdf/document_il/utils/layout_helper.py"
+    layout_file = site / "format/pdf/document_il/utils/layout_helper.py"
     src = layout_file.read_text("utf-8")
     if '"area"' not in src:
         old = '''                        "iou": iou,
@@ -338,12 +379,12 @@ def main() -> None:
         print("patched: layout_helper.py (area 字段)")
 
     for rel, replacements in PATCHES:
-        f = SITE / rel
+        f = site / rel
         src = f.read_text("utf-8")
         changed = False
-        for old, new in replacements:
-            if new in src and old not in src:
-                continue  # 已应用
+        for old, new, marker in replacements:
+            if marker in src:
+                continue  # 已应用（按"新串独有标记"判定，插入型补丁才不会重复插入）
             n = src.count(old)
             assert n == 1, f"{rel}: 目标片段出现 {n} 次（应为 1），请人工检查。\n片段开头: {old[:80]!r}"
             src = src.replace(old, new)

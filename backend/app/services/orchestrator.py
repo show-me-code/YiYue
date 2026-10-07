@@ -24,7 +24,7 @@ from app import config
 from app.db import engine
 from app.models import Profile, Task, TaskOutput
 from app.services import (arxiv_engine, babeldoc_runner, cache, pdfops,
-                          tectonic, tex_translate, verify)
+                          tectonic, tex_translate, textio, verify)
 from app.services.babeldoc_runner import BabelDOCError, RunnerOptions
 from app.services.glossary import entries_to_glossaries
 
@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 class TaskCancelled(Exception):
     pass
+
+
+# 每个 SSE 订阅者的队列上限：客户端读得慢时不能无限堆积事件
+SUBSCRIBER_QUEUE_SIZE = 256
 
 
 def _now():
@@ -47,25 +51,47 @@ class TaskManager:
         self._inner: asyncio.Task | None = None  # 当前任务的运行 task
         self.current_task_id: int | None = None
         self._cancel_requested: set[int] = set()
+        self._queued: set[int] = set()  # 队列里等待执行的任务（submit 去重用）
         self._subscribers: dict[int, set[asyncio.Queue]] = {}
         self._notes: dict[int, str] = {}  # 引擎回退等备注，完成时随任务展示
 
     # ---------- 订阅 ----------
     def subscribe(self, task_id: int) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue()
+        q: asyncio.Queue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_SIZE)
         self._subscribers.setdefault(task_id, set()).add(q)
         return q
 
     def unsubscribe(self, task_id: int, q: asyncio.Queue) -> None:
-        self._subscribers.get(task_id, set()).discard(q)
+        subs = self._subscribers.get(task_id)
+        if not subs:
+            return
+        subs.discard(q)
+        if not subs:
+            # 空集合也要删掉：否则 _subscribers 只增不减，长跑进程里越攒越多
+            self._subscribers.pop(task_id, None)
 
     def broadcast(self, task_id: int, payload: dict) -> None:
+        subs = self._subscribers.get(task_id)
+        if not subs:
+            return
         msg = json.dumps(payload, ensure_ascii=False, default=str)
-        for q in list(self._subscribers.get(task_id, ())):
-            q.put_nowait(msg)
+        for q in list(subs):
+            try:
+                q.put_nowait(msg)
+            except asyncio.QueueFull:
+                # 慢客户端：丢掉最旧一帧。state/progress 都是全量快照，
+                # 丢中间帧不会让前端状态失真，但队列无上限会吃光内存。
+                try:
+                    q.get_nowait()
+                    q.put_nowait(msg)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
 
     # ---------- 队列 ----------
     def submit(self, task_id: int) -> None:
+        if task_id in self._queued or task_id == self.current_task_id:
+            return  # 去重：同一任务重复入队会被翻译两次并互相覆盖输出
+        self._queued.add(task_id)
         self.queue.put_nowait(task_id)
 
     async def start(self) -> None:
@@ -76,15 +102,25 @@ class TaskManager:
         # 事件循环变更（如测试环境中 TestClient 反复启停）时重建 worker。
         # asyncio.Queue 绑定循环，一并重建；旧循环中的排队任务视为丢失。
         self.queue = asyncio.Queue()
+        self._queued.clear()
         self._worker = asyncio.create_task(self._worker_loop(), name="task-worker")
         self._worker_loop_owner = loop
 
     async def cancel(self, task_id: int) -> bool:
-        """取消任务：排队中会在出队时标记；翻译中取消当前运行。"""
-        self._cancel_requested.add(task_id)
-        if task_id == self.current_task_id and self._inner and not self._inner.done():
+        """取消任务：排队中会在出队时标记；翻译中取消当前运行。
+
+        只对"真的在跑或在排"的任务记取消标记：对已完成任务也留标记的话，
+        用户随后点「重试」时任务一出队就被判取消，永远重试不了。
+        """
+        if (task_id == self.current_task_id and self._inner is not None
+                and not self._inner.done()):
+            self._cancel_requested.add(task_id)
             self._inner.cancel()
-        return True
+            return True
+        if task_id in self._queued:
+            self._cancel_requested.add(task_id)
+            return True
+        return False
 
     # ---------- 状态写回 ----------
     def _update_task(self, task_id: int, **fields) -> Task | None:
@@ -133,22 +169,24 @@ class TaskManager:
     async def _worker_loop(self) -> None:
         while True:
             task_id = await self.queue.get()
+            self._queued.discard(task_id)
             self.current_task_id = task_id
             inner = asyncio.create_task(self._run_task(task_id))
             self._inner = inner
             await asyncio.wait({inner})
-            if inner.cancelled():
-                # 未走 TaskCancelled 路径的直接取消（如段间等待时被取消）
+            exc = None if inner.cancelled() else inner.exception()
+            # 排队中就取消时 _run_task 直接抛 TaskCancelled（没有对应的
+            # _set_status 调用），必须在这里归入 cancelled——否则用户看到
+            # 状态"失败"且错误信息为空字符串。
+            if inner.cancelled() or isinstance(exc, TaskCancelled):
                 self._set_status(task_id, "cancelled", finished_at=_now())
                 self.broadcast(task_id, {"type": "cancelled"})
-            else:
-                exc = inner.exception()
-                if exc is not None:
-                    logger.exception("task %s failed", task_id)
-                    self._set_status(
-                        task_id, "failed", error=str(exc), finished_at=_now()
-                    )
-                    self.broadcast(task_id, {"type": "error", "message": str(exc)})
+            elif exc is not None:
+                logger.exception("task %s failed", task_id)
+                self._set_status(
+                    task_id, "failed", error=str(exc), finished_at=_now()
+                )
+                self.broadcast(task_id, {"type": "error", "message": str(exc)})
             self._inner = None
             self.current_task_id = None
             self._cancel_requested.discard(task_id)
@@ -378,7 +416,9 @@ class TaskManager:
                                 ignore=shutil.ignore_patterns("source.bin"))
                 probe_main = dir_path / cand.relative_to(src_dir)
                 # 试编译即应用中文预处理：提前拉取 ctex/Fandol 宏包并暴露相关问题
-                text = probe_main.read_text("utf-8", errors="replace")
+                # 用 textio 无损读取：errors="replace" 会把 latin-1 重音字母变成
+                # U+FFFD 并随写回固化进源码（成品里出现"�"）。
+                text = textio.load_text(probe_main)
                 probe_main.write_text(
                     tex_translate.prepare_for_xetex(
                         text, task.lang_out, self._line_spread(task)), "utf-8")
@@ -438,9 +478,7 @@ class TaskManager:
 
         for fi, f in enumerate(files):
             rel = f.relative_to(src_dir)
-            text = await asyncio.to_thread(
-                f.read_text, encoding="utf-8", errors="replace"
-            )
+            text = await asyncio.to_thread(textio.load_text, f)
             translated = await asyncio.to_thread(
                 tex_translate.translate_tex, text, translator,
                 task.lang_out, chunk_cb(fi, rel.name), tex_stats,
@@ -604,9 +642,16 @@ class TaskManager:
         reader = PdfReader(src)
         writer = PdfWriter()
         total = len(reader.pages)
+        added = 0
         for a, b in ranges:
             for p0 in range(max(a, 1), min(b, total) + 1):
                 writer.add_page(reader.pages[p0 - 1])
+                added += 1
+        if added == 0:
+            # 出 0 页 PDF 会让后面分段/翻译/合并拿到空文档，最终"成功"产出
+            # 一份空白 PDF（用户看到 done 却什么都没翻）。这里直接失败并说明原因。
+            raise ValueError(
+                f"页码范围 {pages_expr!r} 没有匹配到任何页（原文共 {total} 页）")
         with open(dst, "wb") as f:
             writer.write(f)
 

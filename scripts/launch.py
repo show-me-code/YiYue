@@ -60,10 +60,45 @@ def port_holder_pids(port: int = PORT) -> list[int]:
     return pids
 
 
+def _pid_command_line(pid: int) -> str:
+    """进程命令行，用来确认占用端口的确实是本应用的 uvicorn。"""
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}')"
+                 ".CommandLine"],
+                capture_output=True, text=True, timeout=25,
+                encoding="utf-8", errors="replace").stdout
+            return (out or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+    try:
+        return (Path(f"/proc/{pid}/cmdline").read_bytes()
+                .replace(b"\0", b" ").decode("utf-8", "replace")).strip()
+    except OSError:
+        return ""
+
+
+def _is_our_server(cmd_line: str) -> bool:
+    cmd = cmd_line.lower()
+    return "uvicorn" in cmd and "app.main" in cmd
+
+
 def free_stale_port() -> None:
-    """健康检查不通过却占着端口 → 清掉它再启动，避免"点了没反应"。"""
+    """健康检查不通过却占着端口 → 清掉它再启动，避免"点了没反应"。
+
+    只结束**确认是本应用 uvicorn** 的进程：8000 是很常见的开发端口，
+    无差别 taskkill 会把用户自己的服务杀掉。
+    """
     for pid in port_holder_pids():
-        log(f"端口 {PORT} 被进程 {pid} 占用但服务不健康，正在清理…")
+        cmd = _pid_command_line(pid)
+        if not _is_our_server(cmd):
+            log(f"注意：端口 {PORT} 被进程 {pid} 占用，但它不是译阅的 uvicorn"
+                f"（命令行：{cmd[:120] or '未知'}）。不会自动结束它——"
+                "请自行关闭该程序，或修改 scripts/launch.py 里的 PORT。")
+            continue
+        log(f"端口 {PORT} 被残留的译阅进程 {pid} 占用但服务不健康，正在清理…")
         try:
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                            capture_output=True, timeout=15)

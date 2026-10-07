@@ -1,5 +1,6 @@
 """PDF 切分/合并/页数，基于 pypdf。"""
 
+import time
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
@@ -27,8 +28,14 @@ def split_pdf(src: str | Path, out_dir: str | Path, part_size: int) -> list[Path
     return parts
 
 
-def merge_pdfs(paths: list[str | Path], out: str | Path) -> None:
-    """按顺序合并 PDF；先写临时文件再原子替换。"""
+def merge_pdfs(paths: list[str | Path], out: str | Path,
+               retries: int = 6) -> None:
+    """按顺序合并 PDF；先写临时文件再原子替换。
+
+    替换会重试：Windows 上目标文件被别的进程打开（阅读器正在拉取增量合并
+    出来的 mono.pdf）时 `os.replace` 抛 PermissionError，一次失败就会让
+    "翻完即读"把整个任务判成失败。等读者释放句柄再替换即可。
+    """
     writer = PdfWriter()
     for p in paths:
         writer.append(str(p))
@@ -36,7 +43,16 @@ def merge_pdfs(paths: list[str | Path], out: str | Path) -> None:
     tmp = out.with_suffix(".merging.pdf")
     with open(tmp, "wb") as f:
         writer.write(f)
-    tmp.replace(out)
+    last_err: OSError | None = None
+    for attempt in range(retries):
+        try:
+            tmp.replace(out)
+            return
+        except OSError as e:  # 含 Windows PermissionError
+            last_err = e
+            time.sleep(0.3 * (attempt + 1))
+    assert last_err is not None
+    raise last_err
 
 
 def parse_page_ranges(expr: str) -> list[tuple[int, int]]:

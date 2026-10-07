@@ -46,7 +46,8 @@ def test_full_flow_with_parts(client, profile, tmp_path):
     # 必须记录"实际产出这份 PDF 的引擎"，否则回退产出会被误当成源码直译
     assert final["engine_used"] == "babeldoc"
 
-    # Range 请求支持（pdf.js 需要）
+    # Range 请求支持（pdf.js 需要）：由 Starlette FileResponse 原生处理，
+    # 之前 app/api/files.py 里自己拼 206 的分支是死代码（Range 被绑成了查询参数）
     head = client.get(mono_url, headers={"Range": "bytes=0-99"})
     assert head.status_code == 206
     assert head.headers["Content-Range"].startswith("bytes 0-99/")
@@ -54,6 +55,18 @@ def test_full_flow_with_parts(client, profile, tmp_path):
     # 同一 URL 下的 PDF 会被重跑替换，必须禁用缓存，否则浏览器一直显示旧译文
     assert "no-store" in head.headers["Cache-Control"]
     assert "no-store" in client.get(mono_url).headers["Cache-Control"]
+
+    total = len(client.get(mono_url).content)
+    suffix = client.get(mono_url, headers={"Range": "bytes=-64"})
+    assert suffix.status_code == 206
+    assert len(suffix.content) == 64
+    assert suffix.headers["Content-Range"] == f"bytes {total - 64}-{total - 1}/{total}"
+
+    bad = client.get(mono_url, headers={"Range": f"bytes={total + 10}-"})
+    assert bad.status_code == 416
+    assert bad.headers["Content-Range"] == f"bytes */{total}"
+
+    assert "bytes" in client.get(mono_url).headers["Accept-Ranges"]
 
 
 def test_cache_hit_on_same_options(client, profile, tmp_path):

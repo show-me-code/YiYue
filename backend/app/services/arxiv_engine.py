@@ -12,6 +12,7 @@ import httpx
 import pymupdf
 
 from app import config
+from app.services import textio
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,30 @@ def download_source(arxiv_id: str, dest_dir: Path, use_cache: bool = True) -> Pa
     raise ArxivEngineError(f"arXiv 源码下载失败：{last_err}")
 
 
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _safe_tar_member(m: tarfile.TarInfo, dest_dir: Path) -> bool:
+    """判断 tar 成员能否安全解包到 dest_dir。
+
+    只判 `..` 是不够的：Windows 上 `C:/evil`、`\\\\server\\share` 这类成员名在
+    `os.path.join` 里会**丢掉前面的目标目录**，直接写到盘符根；符号链接/硬链接
+    还能把写入引到目标目录之外（tar 成员的 linkname 不受 name 检查约束）。
+    """
+    if m.issym() or m.islnk() or m.isdev():
+        return False
+    name = m.name.replace("\\", "/")
+    if name.startswith("/") or _DRIVE_RE.match(name) or name.startswith("//"):
+        return False
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return False
+    try:  # 双保险：解析后的真实路径必须仍落在目标目录内
+        return (dest_dir / name).resolve().is_relative_to(dest_dir.resolve())
+    except OSError:
+        return False
+
+
 def extract_source(src_file: Path, dest_dir: Path) -> list[Path]:
     """解包源码（tar.gz / tar / 单文件 gz tex），返回解出的 tex 文件列表。"""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -164,20 +189,23 @@ def extract_source(src_file: Path, dest_dir: Path) -> list[Path]:
     texs: list[Path] = []
     try:
         with tarfile.open(fileobj=__import__("io").BytesIO(raw), mode="r:*") as t:
-            safe_members = []
-            for m in t.getmembers():
-                # 防路径穿越
-                if m.name.startswith(("/", "..")) or ".." in Path(m.name).parts:
-                    continue
-                safe_members.append(m)
-            t.extractall(dest_dir, members=safe_members)
+            safe_members = [m for m in t.getmembers()
+                            if _safe_tar_member(m, dest_dir)]
+            dropped = len(t.getmembers()) - len(safe_members)
+            if dropped:
+                logger.warning("源码包里有 %d 个危险成员（绝对路径/穿越/链接），已跳过",
+                               dropped)
+            try:
+                t.extractall(dest_dir, members=safe_members, filter="data")
+            except TypeError:  # Python < 3.12 没有 filter 参数
+                t.extractall(dest_dir, members=safe_members)
             texs = [p for p in dest_dir.rglob("*.tex")]
     except tarfile.ReadError:
         # 单文件 gzip 的 tex
         try:
-            text = gzip.decompress(raw).decode("utf-8", errors="replace")
+            text = textio.decode_source_bytes(gzip.decompress(raw))
         except Exception:
-            text = raw.decode("utf-8", errors="replace")
+            text = textio.decode_source_bytes(raw)
         if "\\documentclass" in text or "\\begin{document}" in text:
             out = dest_dir / "main.tex"
             out.write_text(text, "utf-8")
@@ -190,11 +218,11 @@ def extract_source(src_file: Path, dest_dir: Path) -> list[Path]:
 
 
 def rank_main_tex(texs: list[Path]) -> list[Path]:
-    """按可能性排序候选主文件：main.tex 优先，其次 \input 数，再次体积。"""
+    r"""按可能性排序候选主文件：main.tex 优先，其次 \input 数，再次体积。"""
     candidates = []
     for p in texs:
         try:
-            text = p.read_text("utf-8", errors="replace")
+            text = textio.load_text(p)
         except OSError:
             continue
         if "\\documentclass" in text and "\\begin{document}" in text:
@@ -225,7 +253,7 @@ def collect_doc_files(main_tex: Path, texs: list[Path]) -> list[Path]:
     while stack:
         cur = stack.pop()
         try:
-            text = cur.read_text("utf-8", errors="replace")
+            text = textio.load_text(cur)
         except OSError:
             continue
         for m in re.finditer(r"\\(?:input|include)\{([^{}]+)\}", text):
@@ -242,9 +270,7 @@ def compile_ready_check(texs: list[Path]) -> None:
     """基本检查：存在 bbl 或 内嵌 thebibliography（保证参考文献可编译）。"""
     for p in texs:
         try:
-            if p.with_suffix(".bbl").exists() or "thebibliography" in p.read_text(
-                "utf-8", errors="replace"
-            ):
+            if p.with_suffix(".bbl").exists() or "thebibliography" in textio.load_text(p):
                 return
         except OSError:
             continue
@@ -252,10 +278,36 @@ def compile_ready_check(texs: list[Path]) -> None:
 
 
 _BIBLIOGRAPHY_RE = re.compile(r"\\bibliography\{([^{}]+)\}")
+_INLINE_COMMENT_RE = re.compile(r"(?<!\\)%")
 
 
-def _uncommented_lines(text: str):
-    return [ln for ln in text.splitlines() if not ln.lstrip().startswith("%")]
+def _code_part(line: str) -> str:
+    """行内第一个未转义 % 之前的部分（注释不参与检测与替换）。"""
+    m = _INLINE_COMMENT_RE.search(line)
+    return line[:m.start()] if m else line
+
+
+def _bbl_target(name: str, main_tex: Path) -> Path:
+    """\\bibliography{名} 对应的 .bbl 落盘位置（保留子目录，剔除越界路径）。"""
+    rel = Path(name)
+    if rel.is_absolute() or ".." in rel.parts:
+        rel = Path(rel.name)
+    return main_tex.parent / f"{rel}.bbl"
+
+
+def _bbl_for(name: str, main_tex: Path, bbls: list[Path]) -> tuple[Path, str]:
+    """为 \\bibliography{name} 准备一个可 \\input 的 .bbl，返回 (路径, 来源说明)。"""
+    target = _bbl_target(name, main_tex)
+    if target.exists():
+        return target, "自带同名 .bbl"
+    source = (
+        next((b for b in bbls if b.stem == Path(name).name), None)
+        or next((b for b in bbls if b.stem == main_tex.stem), None)
+        or bbls[0]
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(source, target)
+    return target, source.name
 
 
 def use_shipped_bbl(src_root: Path, main_tex: Path) -> dict:
@@ -267,34 +319,55 @@ def use_shipped_bbl(src_root: Path, main_tex: Path) -> dict:
     检测到 \bibliography 会自己跑 BibTeX，用不存在的 .bib 覆盖掉 .bbl。
     因此这里把 \bibliography{x} 直接改写为 \input{x.bbl}，引用即恢复。
 
+    只在**非注释代码段**上替换：注释里的 `% \bibliography{old}` 若先出现，
+    "只替换第一处"会把注释改掉、真正的命令原样留下，引用照样全变 (?)。
     返回 {"applied": bool, "reason": str, "mapping": [[x, 来源文件], ...]}
     """
     try:
-        text = main_tex.read_text("utf-8", errors="replace")
+        text = textio.load_text(main_tex)
     except OSError as e:
         return {"applied": False, "reason": f"主文件不可读：{e}", "mapping": []}
-    hits = [m for ln in _uncommented_lines(text)
-            for m in _BIBLIOGRAPHY_RE.finditer(ln)]
+
+    lines = text.splitlines(keepends=True)
+    codes = [_code_part(ln) for ln in lines]
+    hits = [m for code in codes for m in _BIBLIOGRAPHY_RE.finditer(code)]
     if not hits:
         return {"applied": False, "reason": "未使用 \\bibliography", "mapping": []}
     bbls = sorted(p for p in src_root.rglob("*.bbl"))
     if not bbls:
         return {"applied": False, "reason": "源码包中没有 .bbl", "mapping": []}
 
-    names = [n.strip() for n in hits[0].group(1).split(",") if n.strip()]
+    names: list[str] = []
+    for m in hits:
+        for n in m.group(1).split(","):
+            n = n.strip()
+            if n and n not in names:
+                names.append(n)
     if not names:
         return {"applied": False, "reason": "\\bibliography 参数为空", "mapping": []}
+
     mapping: list[list[str]] = []
     for name in names:
-        target = main_tex.parent / f"{Path(name).name}.bbl"
-        if target.exists():
-            mapping.append([name, "自带同名 .bbl"])
-            continue
-        source = next((b for b in bbls if b.stem == main_tex.stem), bbls[0])
-        shutil.copy(source, target)
-        mapping.append([name, source.name])
-    new_text = _BIBLIOGRAPHY_RE.sub(
-        lambda m: "\\input{" + names[0] + ".bbl}", text, count=1)
-    main_tex.write_text(new_text, "utf-8")
+        _, origin = _bbl_for(name, main_tex, bbls)
+        mapping.append([name, origin])
+
+    def rewrite(m: re.Match) -> str:
+        parts = []
+        for n in (x.strip() for x in m.group(1).split(",")):
+            if not n:
+                continue
+            target = _bbl_target(n, main_tex)
+            # \input 的路径必须和 .bbl 实际落盘位置一致（子目录名不能丢）
+            parts.append("\\input{" + target.relative_to(main_tex.parent).as_posix()
+                         + "}")
+        return "".join(parts) or m.group(0)
+
+    new_lines = []
+    for ln, code in zip(lines, codes):
+        if "\\bibliography" in code:
+            new_lines.append(_BIBLIOGRAPHY_RE.sub(rewrite, code) + ln[len(code):])
+        else:
+            new_lines.append(ln)
+    main_tex.write_text("".join(new_lines), "utf-8")
     logger.info("using authors' .bbl: %s", mapping)
     return {"applied": True, "reason": "", "mapping": mapping}
