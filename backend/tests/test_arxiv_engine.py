@@ -435,7 +435,7 @@ def test_verify_passes_and_notes_layout_shift(tmp_path):
 
 
 def test_verify_flags_new_overflow_and_missing_captions(tmp_path):
-    """超出基线版心 + 图表标题数变少 = 真问题，必须判为需人工复核。"""
+    """超出基线版心 + 图表标题数变少 + 真有正文未翻译 = 真问题，必须判为需人工复核。"""
     from app.services import verify
 
     base = tmp_path / "baseline.pdf"
@@ -443,13 +443,31 @@ def test_verify_flags_new_overflow_and_missing_captions(tmp_path):
     _make_pdf(base, [(1, 72, 100, "Figure 1: a caption"), (1, 72, 700, "References")])
     _make_pdf(bad, [(1, 10, 120, "text outside the left margin"), (1, 72, 700, "References")])
     report = verify.verify_translation(
-        bad, base, tmp_path / "verify", issues={"chunks_untranslated": 2})
+        bad, base, tmp_path / "verify",
+        # 英文词数是"真丢了正文"还是"纯结构块被回退"的分界
+        issues={"chunks_untranslated": 2, "chunks_failed_english_words": 300})
     assert report["verdict"] == "需人工复核"
     assert report["overflow"]["new_pages"] == [1]
     reasons = " ".join(report["reasons"])
     assert "超出基线版心" in reasons
     assert "图表标题数少于基线" in reasons
     assert "未翻译" in reasons
+
+
+def test_verify_treats_structural_chunk_revert_as_note(tmp_path):
+    """只涉及极少英文词的块回退（纯命令/表格）不该判为"未翻译"。"""
+    from app.services import verify
+
+    base = tmp_path / "baseline.pdf"
+    zh = tmp_path / "translated.pdf"
+    _make_pdf(base, [(1, 72, 100, "Figure 1: a caption"), (1, 72, 700, "References")])
+    _make_pdf(zh, [(1, 72, 100, "Tu 1: caption"), (1, 72, 700, "References")])
+    report = verify.verify_translation(
+        zh, base, tmp_path / "verify",
+        issues={"chunks_untranslated": 2, "chunks_failed_english_words": 0,
+                "chunks_failed_detail": ["重试后仍不合格（占位符/结构校验）：[[M0]]"]})
+    assert not any("未翻译" in r for r in report["reasons"])
+    assert any("纯命令/结构块" in n for n in report["notes"])
 
 
 def test_verify_preserves_author_overflow_as_note(tmp_path):

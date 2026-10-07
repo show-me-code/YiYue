@@ -507,6 +507,14 @@ class TaskManager:
             )
             translated = tex_translate.prepare_for_xetex(
                 translated, task.lang_out, self._line_spread(task))
+            # 源码层章节命令数：闭环验证的**精确**判据（PDF 文本计数会被中文断行、
+            # 表格编号行干扰，实测 2607.03728 因此误报"可能有整节内容丢失"）
+            tex_stats["section_cmds_in"] = (
+                tex_stats.get("section_cmds_in", 0)
+                + tex_translate.count_section_cmds(text))
+            tex_stats["section_cmds_out"] = (
+                tex_stats.get("section_cmds_out", 0)
+                + tex_translate.count_section_cmds(translated))
             target = out_src / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(target.write_text, translated, "utf-8")

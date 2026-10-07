@@ -75,6 +75,32 @@ def english_residue(text: str, ref_heading_re: re.Pattern = _REF_HEADING_RE,
 
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def english_residue_split(text_t: str, text_b: str,
+                          limit: int = 5) -> tuple[list[str], list[str]]:
+    """把英文残留分成 (疑似漏译, 插图/表格图片内的原文)。
+
+    插图与表格图片里的英文在译文和基线里是**同一份对象**，抽取出来一模一样；
+    它属于"保留作者原图"（见用户规格第 4 条），不是漏译——不区分的话，每篇带
+    矢量图的论文都会被判"需人工复核"（实测 2607.03728 的 fig5 就是这种）。
+    比较前统一空白，避免同一段文字在两边因换行不同而匹配不上。
+    """
+    residue = english_residue(text_t, limit=limit * 4)
+    baseline = _normalize_ws(text_b)
+    leaked: list[str] = []
+    graphic: list[str] = []
+    for item in residue:
+        norm = _normalize_ws(item)
+        if norm and norm in baseline:
+            graphic.append(item)
+        else:
+            leaked.append(item)
+    return leaked[:limit], graphic[:limit]
 # 行首的图表标题（"图 4: ..."）。行内正文引用（"如图 6 所示"）不会命中，
 # 否则会把 "图 6 中 Raghu et al. 的模型" 误判成英文图注。
 _CAPTION_LINE_RE = re.compile(r"(?m)^\s*(?:图|Figure)\s*~?\s*\d+\s*[:：]?\s*([^\n]{0,200})")
@@ -131,6 +157,38 @@ def overflow_pt(ink: pymupdf.Rect, area: pymupdf.Rect) -> float:
     """墨迹超出版心的最大量（pt）；不超出为 0。"""
     return max(0.0, area.x0 - ink.x0, ink.x1 - area.x1,
                area.y0 - ink.y0, ink.y1 - area.y1)
+
+
+def section_judgement(translated_count: int, baseline_count: int,
+                      src_in: int | None, src_out: int | None
+                      ) -> tuple[list[str], list[str]]:
+    """章节标题判定：源码层命令数是硬判据，PDF 文本计数只是启发式。
+
+    PDF 计数会被中文断行（编号与标题分行）与表格里的编号行干扰，实测
+    2607.03728 因此误报"可能有整节内容丢失"——而源码层 \\section 命令数完全一致。
+    因此：有源码计数就以它为准；没有时才退回启发式。
+    """
+    reasons: list[str] = []
+    notes: list[str] = []
+    gap = baseline_count - translated_count
+    have_src = isinstance(src_in, int) and isinstance(src_out, int)
+    if have_src and src_in != src_out:
+        reasons.append(
+            f"源码层章节命令数不一致（{src_in} → {src_out}）：标题结构被改动，"
+            "需排查是否有整节丢失或多出")
+    elif have_src:
+        if gap:
+            notes.append(
+                f"PDF 里章节标题计数少 {gap} 条（{translated_count} < {baseline_count}），"
+                f"但源码层 \\section 命令数一致（{src_in} → {src_out}）："
+                "系中文断行/表格编号造成的计数抖动，无内容丢失")
+    elif gap >= 3:
+        reasons.append(f"章节标题数明显少于基线（{translated_count} < "
+                       f"{baseline_count}），可能有整节内容丢失")
+    elif gap > 0:
+        notes.append(f"章节标题计数少 {gap} 条（{translated_count} < {baseline_count}）："
+                     "中文断行会让编号与标题分行，属计数抖动，抽查对应页确认即可")
+    return reasons, notes
 
 
 def new_overflow_pages(overflow_t: list[int], overflow_b: list[int]) -> list[int]:
@@ -281,16 +339,20 @@ def verify_translation(
                     .save(zoom_dir / f"p{p:02d}_src.png")
 
     text_t, text_b = _doc_text(doc_t), _doc_text(doc_b)
-    residue = english_residue(text_t)
+    residue, residue_graphics = english_residue_split(text_t, text_b)
     zh_captions = english_captions(text_t)
     content = {
         "captions_translated": len(_CAPTION_RE.findall(text_t)),
         "captions_baseline": len(_CAPTION_RE.findall(text_b)),
         "sections_translated": section_count(text_t),
         "sections_baseline": section_count(text_b),
+        "section_cmds_in": issues.get("section_cmds_in") if issues else None,
+        "section_cmds_out": issues.get("section_cmds_out") if issues else None,
         "references_heading": bool(_REF_HEADING_RE.search(text_t)),
         "english_lines": len(residue),
         "english_sample": residue[0][:160] if residue else None,
+        "english_from_graphics": len(residue_graphics),
+        "english_graphics_sample": residue_graphics[0][:120] if residue_graphics else None,
         "english_captions": len(zh_captions),
         "english_caption_sample": zh_captions[0] if zh_captions else None,
     }
@@ -317,21 +379,24 @@ def verify_translation(
     if content["captions_translated"] < content["captions_baseline"]:
         reasons.append(f"图表标题数少于基线（{content['captions_translated']} < "
                        f"{content['captions_baseline']}），可能有图注漏译或丢失")
-    # 章节标题计数受断行影响会有 ±1~2 的抖动，只差一两条时作为提示而非结论
-    section_gap = content["sections_baseline"] - content["sections_translated"]
-    if section_gap >= 3:
-        reasons.append(f"章节标题数明显少于基线（{content['sections_translated']} < "
-                       f"{content['sections_baseline']}），可能有整节内容丢失")
-    elif section_gap > 0:
-        notes.append(f"章节标题计数少 {section_gap} 条（{content['sections_translated']} < "
-                     f"{content['sections_baseline']}）：中文断行会让编号与标题分行，"
-                     "属计数抖动，抽查对应页确认即可")
+    # 章节标题：源码层的 \section 命令数是**精确**判据；PDF 文本计数只是启发式
+    # （中文断行会把编号与标题拆行，表格里的编号行也会被算进去），两者分开判。
+    sec_reasons, sec_notes = section_judgement(
+        content["sections_translated"], content["sections_baseline"],
+        issues.get("section_cmds_in"), issues.get("section_cmds_out"))
+    reasons += sec_reasons
+    notes += sec_notes
     if not content["references_heading"]:
         reasons.append("译文里找不到「参考文献 / References」标题")
     if content["english_lines"] >= 3:
         reasons.append(
             f"译文正文里仍有 {content['english_lines']} 行成句英文（该节可能没翻译）："
             f"「{(content['english_sample'] or '')[:60]}…」")
+    if content.get("english_from_graphics"):
+        notes.append(
+            f"{content['english_from_graphics']} 行英文与基线逐字相同 → 来自插图/表格"
+            f"图片内部（按「保留作者原图」原则不动）："
+            f"「{(content.get('english_graphics_sample') or '')[:50]}…」")
     if issues.get("files_reverted"):
         reasons.append(
             f"以下文件因编译失败被退回英文原文重编（该节未翻译）：{issues['files_reverted']}")
@@ -346,7 +411,21 @@ def verify_translation(
     if content.get("spacing_warning"):
         reasons.append(content["spacing_warning"])
     if issues.get("chunks_untranslated"):
-        reasons.append(f"{issues['chunks_untranslated']} 个正文块未翻译（已保留英文）")
+        n_failed = issues["chunks_untranslated"]
+        words = issues.get("chunks_failed_english_words", 0) or 0
+        detail = issues.get("chunks_failed_detail") or []
+        extra = f"（示例：{str(detail[0])[:90]}）" if detail else ""
+        if words >= 20:
+            reasons.append(
+                f"{n_failed} 个正文块未翻译（合计 {words} 个英文词，已保留英文）{extra}")
+        else:
+            # 纯命令/表格等受保护内容的块：回退后与译文等价，没有可见影响
+            notes.append(
+                f"{n_failed} 个块被回退为原文，但合计只涉及 {words} 个英文词 → "
+                f"属纯命令/结构块（无正文可译），成品内容无损失{extra}")
+    if issues.get("chunks_split_recovered"):
+        notes.append(f"{issues['chunks_split_recovered']} 个正文块整块翻译失败后"
+                     "拆成两半重试成功（内容已完整翻译）")
     if issues.get("chunks_timeout") or issues.get("captions_timeout"):
         n_to = (issues.get("chunks_timeout") or 0) + (issues.get("captions_timeout") or 0)
         reasons.append(
@@ -437,12 +516,17 @@ def summary_text(report: dict) -> str:
             lines.append(f"  p{p['page']:>3}: {p.get('note', '')}")
     c = report["content"]
     baseline_spacing = report.get("baseline_content", {}).get("spacing", {})
+    sec_src = ""
+    if isinstance(c.get("section_cmds_in"), int):
+        sec_src = (f"（源码层 \\section 命令 {c['section_cmds_in']} → "
+                   f"{c.get('section_cmds_out')}）")
     lines += [
         "",
         f"内容完整性：图表标题 {c['captions_translated']}/{c['captions_baseline']}，"
-        f"章节标题 {c['sections_translated']}/{c['sections_baseline']}，"
+        f"章节标题 {c['sections_translated']}/{c['sections_baseline']}{sec_src}，"
         f"参考文献标题 {'有' if c['references_heading'] else '无'}，"
-        f"成句英文残留 {c.get('english_lines', 0)} 行，"
+        f"成句英文残留 {c.get('english_lines', 0)} 行"
+        f"（其中插图/图片内 {c.get('english_from_graphics', 0)} 行），"
         f"英文图表标题 {c.get('english_captions', 0)} 条",
         f"行距：段内 {c.get('spacing', {}).get('body_leading_pt', '?')}pt"
         f"（一致性 {c.get('spacing', {}).get('leading_uniformity', '?')}%），"

@@ -18,6 +18,11 @@ import uvicorn  # noqa: E402
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+# 预热 sqlalchemy：它首次导入会调 platform.machine() → Windows WMI 查询，本机实测
+# 偶发卡 ~20 秒并抛 "Windows fatal exception: code 0x8007000e"（E_OUTOFMEMORY）。
+# 落在某个测试中间会让该测试随机变慢/报错，所以放到会话最开始（单线程）导入一次。
+import app.db  # noqa: E402,F401
+
 
 def make_sample_pdf(path: str | Path, pages: int = 2) -> Path:
     """生成带真实文本层的样例 PDF（回声翻译可校验）。"""

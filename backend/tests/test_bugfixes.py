@@ -229,6 +229,23 @@ def test_patch_style_files_keeps_latin1_chars(tmp_path):
     assert "摘要" in out and "café" in out and "\ufffd" not in out
 
 
+def test_patch_style_files_handles_newline_after_font_switch(tmp_path):
+    r"""回归：iclr2026_conference.sty 把 "Abstract" 写在 {\large\sc 的**下一行**，
+    原有三条模式都要求字体命令与 Abstract 之间没有换行，于是成品页面上一直留着
+    英文 "Abstract"（实测 2607.03728 第 1 页）。"""
+    sty = tmp_path / "iclr2026_conference.sty"
+    sty.write_text(
+        "\\renewenvironment{abstract}{\\vskip.075in\\centerline{\\large\\sc\n"
+        "Abstract}\\vspace{0.5ex}\\begin{quote}}{\\par\\end{quote}}\n"
+        "\\def\\abstractname{Abstract}\n",
+        "utf-8")
+    assert tex_translate.patch_style_files(tmp_path) == 1
+    out = sty.read_text("utf-8")
+    assert "Abstract" not in out
+    assert "摘要}\n" in out.replace("\r\n", "\n")
+    assert "\\def\\abstractname{摘要}" in out
+
+
 # ---------- arxiv_engine：解包安全 ----------
 
 def _tar_with(names: dict[str, bytes], symlinks: dict[str, str] | None = None) -> bytes:
@@ -476,7 +493,7 @@ def test_chunk_timeout_reverts_without_hanging(monkeypatch):
 
     class Hanging:
         def translate(self, text, ignore_cache=False):
-            time.sleep(30)          # 远超测试用的上限
+            time.sleep(3)           # 远超测试用的上限
             return text
 
     monkeypatch.setattr(tex_translate, "CHUNK_TIMEOUT_S", 0.3)
@@ -485,7 +502,7 @@ def test_chunk_timeout_reverts_without_hanging(monkeypatch):
     out = tex_translate._translate_chunk(Hanging(), "Some English sentence here.", stats)
     elapsed = time.monotonic() - start
     assert out is None                        # 保留原文
-    assert elapsed < 5                        # 不会陪它等 30s
+    assert elapsed < 2                        # 不会陪它等 3s
     assert stats["chunks_timeout"] == 1
     assert stats["chunks_untranslated"] == 1
 
@@ -500,7 +517,7 @@ def test_chunk_timeout_not_retried(monkeypatch):
 
         def translate(self, text, ignore_cache=False):
             self.calls += 1
-            time.sleep(30)
+            time.sleep(3)
             return text
 
     monkeypatch.setattr(tex_translate, "CHUNK_TIMEOUT_S", 0.2)
@@ -526,7 +543,7 @@ def test_translate_tex_survives_one_hanging_chunk(monkeypatch):
     class PartlyHanging:
         def translate(self, text, ignore_cache=False):
             if "SLOW" in text:
-                time.sleep(30)
+                time.sleep(3)
             return "译 " + text
 
     monkeypatch.setattr(tex_translate, "CHUNK_TIMEOUT_S", 0.3)
@@ -770,6 +787,20 @@ def test_map_parallel_cancel_returns_immediately():
     assert _t.monotonic() - start < 2
 
 
+def test_looks_untranslated_ignores_macro_only_chunks():
+    r"""回归：`{HTML}{1B2A32}` 这类纯宏/颜色块没有句子结构，模型原样返回是**正确**
+    结果，不该被"等于没翻译"拦下（实测 2607.03728 有 2 块因此白白重试后回退）。"""
+    macro_chunk = ("[[M19]] [[M20]] [[M1]]{HTML}{1B2A32} "
+                   "[[M2]]{HTML}{0E7C7B} [[M3]]{HTML}{C44E52} [[M4]]{\\textcolor{INERT}}")
+    assert not tex_translate._looks_untranslated(macro_chunk, macro_chunk)
+
+    # 成句英文的"原样返回"仍要被抓住
+    prose = "The decisive test holds the invariant fixed and changes only the output."
+    assert tex_translate._looks_untranslated(prose, prose)
+    assert tex_translate._looks_untranslated(
+        prose, prose.replace("decisive", "crucial"))
+
+
 def test_looks_untranslated_ignores_formula_heavy_chunks():
     """回归：占位符（公式/命令）在原文与译文里逐字相同，混进相似度会把
     "公式密集但正文确实翻了"的块算成高相似度，译文被无谓退回英文。"""
@@ -811,6 +842,133 @@ def test_translate_tex_parallel_covers_all_chunks_and_captions():
     assert stats.get("chunks_untranslated", 0) == 0
     assert stats.get("captions_untranslated", 0) == 0
     assert (out.count("{"), out.count("}")) == (tex.count("{"), tex.count("}"))
+
+
+def test_chunk_worker_splits_failed_chunk_and_recovers():
+    """整块两次不合格 → 劈成两半各试一次；成功则不再报"未翻译"。"""
+    class Picky:
+        """整块必失败（模拟占位符被写坏），半块可以成功。"""
+
+        def translate(self, text, ignore_cache=False):
+            if len(text) > 600:
+                return text + " {broken"        # 结构被破坏
+            return "译 " + text
+
+    long_chunk = "English sentence here. " * 40      # > 600 字符
+    stats: dict = {}
+    out, local = tex_translate._chunk_worker(Picky(), False)(long_chunk)
+    assert out is not None                           # 拆分后成功
+    assert local.get("chunks_split_recovered") == 1
+    assert "chunks_untranslated" not in local
+    _ = stats
+
+
+def test_chunk_worker_keeps_failure_when_split_also_fails():
+    class AlwaysBad:
+        def translate(self, text, ignore_cache=False):
+            return text + " {broken"
+
+    long_chunk = "English sentence here. " * 40
+    out, local = tex_translate._chunk_worker(AlwaysBad(), False)(long_chunk)
+    assert out is None
+    assert local["chunks_untranslated"] >= 1
+
+
+# ---------- 验证器：别再误报"整节丢失""漏译" ----------
+
+def test_english_residue_split_classifies_graphics_text():
+    """回归：插图里的英文与基线逐字相同，属"保留作者原图"，不是漏译。
+    2607.03728 的 fig5 就因此被误报成"成句英文残留"。"""
+    graphic_line = "Decodability is uniformly high and does not predict deployment"
+    leaked_line = "this whole paragraph was never translated at all here"
+    translated = graphic_line + "\n中文正文\n" + leaked_line
+    baseline = graphic_line + "\n" + "source text " * 5
+
+    leaked, graphics = verify.english_residue_split(translated, baseline)
+    assert graphic_line in graphics
+    assert graphic_line not in leaked
+    assert leaked_line in leaked
+
+
+def test_count_section_cmds_ignores_macro_names_and_comments():
+    r"""回归：`\sectionname`/`\paragraphname` 这类宏名不能当成章节命令。
+
+    实测它让"源码层章节命令数"平白多出一条（19→20），把一篇结构完好的论文
+    判成"标题结构被改动"。
+    """
+    tex = ("\\providecommand\\sectionname{}\n"
+           "\\section{Intro}\n"
+           "\\subsection{Sub}\n"
+           "\\paragraph{Para}\n"
+           "% \\section{commented out}\n"
+           "\\section*{Starred}\n"
+           "\\sectionname xyz")
+    assert tex_translate.count_section_cmds(tex) == 4
+
+
+def test_section_judgement_prefers_source_counts():
+    """有源码层命令数时以它为准：PDF 计数差 4 条也不再报"整节丢失"。"""
+    reasons, notes = verify.section_judgement(85, 89, 12, 12)
+    assert reasons == []
+    assert any("源码层" in n and "无内容丢失" in n for n in notes)
+
+    # 源码层真的少了 → 硬失败
+    reasons, _ = verify.section_judgement(85, 89, 12, 11)
+    assert reasons and "源码层" in reasons[0]
+
+    # 没有源码计数时退回启发式：差 4 条仍报可疑
+    reasons, _ = verify.section_judgement(85, 89, None, None)
+    assert reasons and "整节" in reasons[0]
+
+    # 差 1 条只是提示
+    reasons, notes = verify.section_judgement(88, 89, None, None)
+    assert reasons == [] and notes
+
+
+def test_chunk_failure_details_are_recorded():
+    """失败必须留下可诊断的原因片段（否则报告只会说"有 N 块没翻译"）。"""
+    class Tr:
+        def translate(self, text, ignore_cache=False):
+            raise RuntimeError("endpoint exploded")
+
+    stats: dict = {}
+    assert tex_translate._translate_chunk(Tr(), "some english text here", stats) is None
+    assert stats["chunks_untranslated"] == 1
+    assert "调用失败" in stats["chunks_failed_detail"][0]
+    assert "some english text" in stats["chunks_failed_detail"][0]
+    # 英文词数让验证器能区分"真丢正文"与"纯结构块被回退"
+    assert stats["chunks_failed_english_words"] == 4
+
+
+def test_verify_distinguishes_structural_revert_from_lost_prose(tmp_path):
+    """2 个纯结构块被回退（0 个英文词）→ 提示而不是"未翻译"；真丢正文才报。"""
+    import pymupdf
+
+    from app.services import verify as v
+
+    def make(path, text):
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_textbox(pymupdf.Rect(72, 72, 520, 760), text, fontsize=12)
+        doc.save(path)
+        doc.close()
+
+    zh, src = tmp_path / "zh.pdf", tmp_path / "src.pdf"
+    make(zh, "译文正文示例。" * 40)
+    make(src, "Source body text. " * 20)
+
+    structural = v.verify_translation(
+        zh, src, tmp_path / "v1",
+        issues={"chunks_untranslated": 2, "chunks_failed_english_words": 0,
+                "chunks_failed_detail": ["重试后仍不合格（占位符/结构校验）：[[M0]]"]})
+    assert not any("未翻译" in r for r in structural["reasons"])
+    assert any("纯命令/结构块" in n for n in structural["notes"])
+
+    real_loss = v.verify_translation(
+        zh, src, tmp_path / "v2",
+        issues={"chunks_untranslated": 1, "chunks_failed_english_words": 250,
+                "chunks_failed_detail": ["重试后仍不合格：We train linear probes"]})
+    assert any("1 个正文块未翻译" in r for r in real_loss["reasons"])
 
 
 # ---------- 启动器：只清理我们自己的进程 ----------

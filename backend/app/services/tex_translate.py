@@ -10,6 +10,7 @@ import concurrent.futures
 import logging
 import os
 import re
+import threading
 from fractions import Fraction
 from pathlib import Path
 
@@ -36,32 +37,48 @@ class ChunkTimeout(RuntimeError):
     """单块翻译超过墙钟上限（区别于普通调用失败）。"""
 
 
+# 共享的"看门线程池"：单块翻译跑在这里，父线程用 future.result(timeout=…) 设上限。
+# **不能**每次调用都新建线程池——一篇论文就是几十上百次调用，线程反复创建回收
+# 实测把解释器逼到 "Windows fatal exception: code 0x8007000E"（内存/句柄耗尽），
+# 而且被放弃的调用会把线程占着直到对方超时。池上限与并发度一致，正常不会排队。
+_WATCHDOG_POOL: concurrent.futures.ThreadPoolExecutor | None = None
+_WATCHDOG_LOCK = threading.Lock()
+
+
+def _watchdog_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _WATCHDOG_POOL
+    with _WATCHDOG_LOCK:
+        if _WATCHDOG_POOL is None:
+            _WATCHDOG_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, TRANSLATE_WORKERS),
+                thread_name_prefix="yiyue-llm")
+        return _WATCHDOG_POOL
+
+
 def _call_translator(translator, text: str, ignore_cache: bool = False,
                      timeout: float | None = None) -> str:
     """调用 translator.translate，带墙钟上限，避免一个卡死的请求拖死整篇。"""
     timeout = CHUNK_TIMEOUT_S if timeout is None else timeout
-    kwargs = {"ignore_cache": True} if ignore_cache else {}
     if not timeout or timeout <= 0:
-        return translator.translate(text, **kwargs)
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        return translator.translate(
+            text, **({"ignore_cache": True} if ignore_cache else {}))
+    pool = _watchdog_pool()
+    future = pool.submit(
+        lambda: translator.translate(
+            text, **({"ignore_cache": True} if ignore_cache else {})))
     try:
-        future = pool.submit(lambda: translator.translate(text, **kwargs))
-        try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError as e:
-            if timeout >= 10:
-                # 把当时所有线程的栈打到日志：真跑 2607.03728 时只看到"进度不动"、
-                # 进程 CPU 也不涨，无法定位卡在哪一层。下次再卡就有栈可查。
-                try:
-                    import faulthandler
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError as e:
+        if timeout >= 10:
+            # 把当时所有线程的栈打到日志：真跑 2607.03728 时只看到"进度不动"、
+            # 进程 CPU 也不涨，无法定位卡在哪一层。下次再卡就有栈可查。
+            try:
+                import faulthandler
 
-                    faulthandler.dump_traceback()
-                except Exception:  # noqa: BLE001
-                    pass
-            raise ChunkTimeout(f"单块翻译超过 {timeout:.0f}s 未返回") from e
-    finally:
-        # 不等被放弃的请求：它可能还要跑几分钟，但整篇不能陪它一起等
-        pool.shutdown(wait=False)
+                faulthandler.dump_traceback()
+            except Exception:  # noqa: BLE001
+                pass
+        raise ChunkTimeout(f"单块翻译超过 {timeout:.0f}s 未返回") from e
 
 # 整体保护的环境（内部完全不动）
 _PROTECT_ENVS = [
@@ -370,9 +387,37 @@ def _english_word_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z]{3,}", text))
 
 
+# 成句英文：连续 ≥4 个字母词（"The model uses this quantity" 这种）。
+# 单独出现的大写标识符（HTML/DECODE/INERT 这类颜色名、宏名）不算句子——
+# 实测把 `{HTML}{1B2A32}` 这种纯宏块判成"没翻译"，于是模型**正确**的原样返回
+# 被拒掉、重试、最后整块回退（白白浪费两次请求 + 报告里多一条假警报）。
+_ENGLISH_SENTENCE_RE = re.compile(r"(?:[A-Za-z]{2,}[ \t]+){3,}[A-Za-z]{2,}")
+
+
+def _english_sentence_words(text: str) -> int:
+    """成句英文的单词数（只数连续词串里的词）。"""
+    return sum(len(m.group(0).split())
+               for m in _ENGLISH_SENTENCE_RE.finditer(text))
+
+
+def count_section_cmds(tex: str) -> int:
+    """章节类命令出现次数（源码层精确计数，闭环验证用它判定有无整节丢失）。
+
+    只数真正带 `{...}` 参数的（`\\sectionname` 这类宏名不算），且注释里的不算——
+    注释里的示例代码不该影响判定。
+    """
+    text = re.sub(r"(?m)(?<!\\)%.*$", "", tex)
+    return len(_SECTION_COUNT_RE.findall(text))
+
+
 # 章节类标题命令：LLM 偶尔漏译短标题（实测 \section{Introduction} 被原样留下）
+# 后面必须跟 (?![A-Za-z])：否则 `\sectionname`、`\paragraphname` 这类**宏名**会被
+# 当成 \section/\paragraph 匹配（实测让"源码层章节命令数"平白多出一条）。
 _SECTION_CMD_RE = re.compile(
-    r"\\(section|subsection|subsubsection|paragraph|chapter|part)\*?")
+    r"\\(section|subsection|subsubsection|paragraph|chapter|part)\*?(?![A-Za-z])")
+# 计数专用：必须真的带花括号参数，才算一个章节标题
+_SECTION_COUNT_RE = re.compile(
+    r"\\(?:section|subsection|subsubsection|paragraph|chapter|part)\*?\s*\{")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
@@ -437,16 +482,45 @@ def _map_parallel(worker, items: list, stats: dict | None, *,
     return results
 
 
+def _split_chunk(chunk: str) -> list[str]:
+    """把块按最近的段落/句子边界劈成两半（用于失败后的降级重试）。"""
+    mid = len(chunk) // 2
+    for sep in ("\n\n", ". ", "\n", " "):
+        idx = chunk.rfind(sep, 0, mid)
+        if idx > 200:
+            return [chunk[:idx + len(sep)], chunk[idx + len(sep):]]
+    return [chunk]
+
+
 def _chunk_worker(translator, is_caption: bool):
     """构造正文块任务：统计用**局部字典**收集，回主线程再合并。
 
     `_translate_chunk` 里是 `stats[key] = stats.get(key, 0) + 1`，多线程直接共享
     一个 dict 会丢计数。
+
+    整块两次都不合格时，再把长块劈成两半各试一次：实测失败几乎都是"某处占位符
+    被写坏"，劈开后两半往往都能过（2607.03728 就有一整段正文因此得以翻译）。
     """
     def worker(chunk: str):
         local: dict = {}
-        return (_translate_chunk(translator, chunk, local, is_caption=is_caption),
-                local)
+        result = _translate_chunk(translator, chunk, local, is_caption=is_caption)
+        if result is None and not is_caption and len(chunk) >= 600:
+            halves = _split_chunk(chunk)
+            if len(halves) == 2:
+                scratch: dict = {}
+                pieces: list[str] = []
+                for half in halves:
+                    piece = _translate_chunk(translator, half, scratch,
+                                             is_caption=False)
+                    if piece is None:
+                        pieces = []
+                        break
+                    pieces.append(piece)
+                if pieces:
+                    # 劈开成功了：丢掉"整块失败"的计数，改为记一次"拆分恢复"
+                    return "\n\n".join(pieces), {"chunks_split_recovered": 1}
+                # 劈开也不行：保留整块的失败计数（不重复计 scratch）
+        return result, local
     return worker
 
 
@@ -533,27 +607,45 @@ def _translate_english_titles(text: str, translator, stats: dict | None) -> str:
     return text
 
 def _looks_untranslated(src: str, dst: str) -> bool:
-    """译文与原文几乎一致，且原文含足量英文单词 → 判为未翻译（多为历史坏缓存）。
+    """译文与原文几乎一致，且原文含成句英文 → 判为未翻译（多为历史坏缓存）。
 
-    只比较**可翻译文本**（去掉占位符）：公式、命令、引用在原文与译文里逐字相同，
-    混进来会把"公式密集但正文确实翻了"的块算成高相似度——2500 字符里只有几十个
-    英文单词的块相似度轻松 >0.97，译文就被无谓地退回英文。判定改成两条：
-    去掉占位符后逐字相同，或**英文单词数几乎没有减少**（译文是中文时英文单词必然
-    大幅消失）。
+    只比较**可翻译文本**（去掉占位符），并且源文必须真的含"成句英文"（连续词串）：
+    公式、命令、颜色名在原文与译文里逐字相同，混进来会把"公式密集但正文确实翻了"
+    的块算成高相似度；而 `{HTML}{1B2A32}` 这种没有句子结构的宏块，模型原样返回
+    本来就是正确结果，不该被拦。
     """
-    if _english_word_count(src) < 5:
-        return False
     src_prose = _PLACEHOLDER_RE.sub("", src)
+    n_src = _english_sentence_words(src_prose)
+    if n_src < 5:
+        return False
     dst_prose = _PLACEHOLDER_RE.sub("", dst)
     if dst_prose.strip() == src_prose.strip():
         return True
-    n_src = _english_word_count(src_prose)
-    n_dst = _english_word_count(dst_prose)
+    n_dst = _english_sentence_words(dst_prose)
     if n_src and n_dst >= 0.8 * n_src:
         return True
     import difflib
 
     return difflib.SequenceMatcher(None, src_prose, dst_prose).ratio() > 0.97
+
+
+def _note_failure(stats: dict | None, key_fail: str, why: str, chunk: str) -> None:
+    """记一次"该块未翻译"，并留下可诊断的原因片段 + 涉及的英文词数。
+
+    只记计数的话，验证报告只能说"有 N 块没翻译"，无法定位是哪块、为什么
+    （实测复核 2607.03728 时就得靠重跑管线去猜）。英文词数让验证器能区分
+    "真丢了正文"与"只是纯命令/表格结构块被回退"（后者无可见影响）。
+    列表与数字都由 `_merge_stats` 正确合并。
+    """
+    if stats is None:
+        return
+    stats[key_fail] = stats.get(key_fail, 0) + 1
+    stats["chunks_failed_english_words"] = (
+        stats.get("chunks_failed_english_words", 0)
+        + _english_word_count(_PLACEHOLDER_RE.sub(" ", chunk)))
+    details = stats.setdefault("chunks_failed_detail", [])
+    if isinstance(details, list) and len(details) < 8:
+        details.append(f"{why}：{' '.join(chunk.split())[:90]}")
 
 
 def _translate_chunk(translator, chunk: str, stats: dict | None = None,
@@ -579,12 +671,11 @@ def _translate_chunk(translator, chunk: str, stats: dict | None = None,
         logger.warning("chunk translate timed out, keep original: %s", e)
         if stats is not None:
             stats[key_timeout] = stats.get(key_timeout, 0) + 1
-            stats[key_fail] = stats.get(key_fail, 0) + 1
+        _note_failure(stats, key_fail, "翻译超时", chunk)
         return None
     except Exception as e:  # noqa: BLE001
         logger.warning("chunk translate failed, keep original: %s", e)
-        if stats is not None:
-            stats[key_fail] = stats.get(key_fail, 0) + 1
+        _note_failure(stats, key_fail, f"调用失败（{str(e)[:40]}）", chunk)
         return None
     if acceptable(candidate):
         return candidate
@@ -598,14 +689,12 @@ def _translate_chunk(translator, chunk: str, stats: dict | None = None,
         retry = _call_translator(translator, chunk, ignore_cache=True)
     except Exception as e:  # noqa: BLE001
         logger.warning("chunk retry failed, keep original: %s", e)
-        if stats is not None:
-            stats[key_fail] = stats.get(key_fail, 0) + 1
+        _note_failure(stats, key_fail, f"重试调用失败（{str(e)[:40]}）", chunk)
         return None
     if acceptable(retry):
         return retry
     logger.warning("chunk still unacceptable after retry (%s), revert to source", reason)
-    if stats is not None:
-        stats[key_fail] = stats.get(key_fail, 0) + 1
+    _note_failure(stats, key_fail, f"重试后仍不合格（{reason}）", chunk)
     return None
 
 
@@ -877,10 +966,16 @@ def prepare_for_xetex(tex: str, lang_out: str = "zh", line_spread: float = 1.0) 
     return out
 
 
-# 样式文件里硬编码的摘要标题：常见三种写法
+# 样式文件里硬编码的摘要标题：常见写法
 #   {\large\bf Abstract}   （nips_2016_nomarkings.sty 就是这个，原正则 \{Abstract\} 匹配不到）
+#   {\large\sc<换行>Abstract}（iclr2026_conference.sty 的写法：字体命令与 Abstract
+#     之间隔了一个换行，所以必须允许 \s+ 跨行，否则页面上会留着英文 "Abstract"）
 #   \textbf{Abstract} / {Abstract} / \def\abstractname{Abstract}
 _ABSTRACT_HEADING_PATTERNS = (
+    (re.compile(r"((?:\\(?:sc|scshape|bf|bfseries|it|itshape|sl|slshape|large"
+                r"|Large|LARGE|small|footnotesize|normalsize))\s+)Abstract\b"),
+     r"\g<1>摘要"),
+    (re.compile(r"(?m)^(\s*)Abstract(\s*\})"), r"\g<1>摘要\g<2>"),
     (re.compile(r"(\\bfseries\s+|\\bf\s+)Abstract\b"), r"\g<1>摘要"),
     (re.compile(r"(\\textbf\{)Abstract(\})"), r"\g<1>摘要\g<2>"),
     (re.compile(r"(\{)Abstract(\})"), r"\g<1>摘要\g<2>"),
