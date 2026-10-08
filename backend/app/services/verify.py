@@ -360,6 +360,8 @@ def verify_translation(
         "english_captions": len(zh_captions),
         "english_caption_sample": zh_captions[0] if zh_captions else None,
         "placeholder_leaks_in_tex": len(issues.get("placeholder_leaks") or []),
+        "placeholder_leaks_in_comments": len(
+            issues.get("placeholder_leaks_in_comments") or []),
         "placeholder_leaks_in_pdf": len(pdf_leaks),
     }
     spacing_t = spacing_profile(doc_t)
@@ -431,8 +433,13 @@ def verify_translation(
     if issues.get("placeholder_leaks"):
         leaks = issues["placeholder_leaks"]
         shown = "、".join(str(x) for x in list(leaks)[:3])
-        reasons.append(f"成品源码里残留占位符 {len(leaks)} 处（PDF 上会印出 [M7] 这类"
-                       f"垃圾，且那处公式/命令未恢复）：{shown}")
+        reasons.append(f"成品源码里残留占位符 {len(leaks)} 处（会印出 [M7] 这类垃圾，"
+                       f"且那处公式/命令未恢复）：{shown}")
+    if issues.get("placeholder_leaks_in_comments"):
+        leaks = issues["placeholder_leaks_in_comments"]
+        shown = "、".join(str(x) for x in list(leaks)[:3])
+        notes.append(f"成品源码的**注释行**里残留占位符 {len(leaks)} 处"
+                     f"（排版上看不见，但注释内容未完整恢复）：{shown}")
     if pdf_leaks:
         reasons.append(f"成品 PDF 文本里出现占位符字面量 {len(pdf_leaks)} 处："
                        f"{'、'.join(pdf_leaks[:3])}")

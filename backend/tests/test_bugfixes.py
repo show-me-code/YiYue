@@ -1048,7 +1048,8 @@ def test_integrity_ok_rejects_placeholder_count_mismatch():
 
 
 def test_verify_flags_placeholder_leaks(tmp_path):
-    """成品里残留 [[M7]]（PDF 上会印成 [M7]）必须判为需人工复核。"""
+    """成品**活代码**里残留 [[M7]]（PDF 上会印成 [M7]）必须判需人工复核；
+    只落在注释行里的（排版看不见）降级为提示。"""
     import pymupdf
 
     from app.services import verify as v
@@ -1071,6 +1072,15 @@ def test_verify_flags_placeholder_leaks(tmp_path):
     assert report["content"]["placeholder_leaks_in_pdf"] == 2
     assert any("残留占位符" in r for r in report["reasons"])
     assert any("占位符字面量" in r for r in report["reasons"])
+
+    # 只在注释里泄漏：提示而非判失败
+    only_comment = v.verify_translation(
+        zh, src, tmp_path / "verify2",
+        issues={"placeholder_leaks": [],
+                "placeholder_leaks_in_comments": ["appendix.tex:42:[[M12]]"]})
+    assert not any("残留占位符" in r for r in only_comment["reasons"])
+    assert only_comment["content"]["placeholder_leaks_in_comments"] == 1
+    assert any("注释行" in n for n in only_comment["notes"])
 
 
 # ---------- 启动器：只清理我们自己的进程 ----------

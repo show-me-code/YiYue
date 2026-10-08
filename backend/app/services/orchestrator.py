@@ -12,6 +12,7 @@ SSE 事件（JSON 字符串入订阅队列）：
 import asyncio
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -521,13 +522,20 @@ class TaskManager:
             tex_stats["section_cmds_out"] = (
                 tex_stats.get("section_cmds_out", 0)
                 + tex_translate.count_section_cmds(translated))
-            # 占位符泄漏：成品源码里残留 [[M#]]/[[C#]] 的话，PDF 上会直接印出
-            # "[M7]" 这种垃圾（并且意味着那处公式/命令没恢复回去）
-            splits = tex_stats.setdefault("placeholder_leaks", [])
+            # 占位符泄漏：成品源码里残留 [[M#]]/[[C#]] 的话，意味着那处公式/命令没
+            # 恢复回去。分两类：落在**注释行里**的只影响注释内容（排版上看不见），
+            # 落在活代码里的会在 PDF 上直接印出 "[M7]" 这类垃圾——判级不同。
             for m in tex_translate._PLACEHOLDER_RE.finditer(translated):
-                if len(splits) < 8:
-                    line_no = translated[:m.start()].count("\n") + 1
-                    splits.append(f"{rel.name}:{line_no}:{m.group(0)}")
+                line_start = translated.rfind("\n", 0, m.start()) + 1
+                before = translated[line_start:m.start()]
+                bucket = ("placeholder_leaks_in_comments"
+                          if re.search(r"(?<!\\)%", before)
+                          else "placeholder_leaks")
+                items = tex_stats.setdefault(bucket, [])
+                if len(items) < 8:
+                    items.append(f"{rel.name}:"
+                                 f"{translated[:m.start()].count(chr(10)) + 1}:"
+                                 f"{m.group(0)}")
             target = out_src / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(target.write_text, translated, "utf-8")
