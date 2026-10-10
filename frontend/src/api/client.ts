@@ -89,6 +89,39 @@ export interface Task {
   /** 创建到结束的秒数（后端算好，前端不必再解析两个时间） */
   duration_s: number | null
   outputs: TaskOutput[]
+  /** 论文标题（离线从源码/文件名提取）与中文标题、LLM 主题词 */
+  title_en: string | null
+  title_zh: string | null
+  topics: string[]
+  archived: boolean
+  polish: string
+}
+
+export interface ParagraphPair {
+  i: number
+  page?: number
+  kind?: 'para' | 'heading' | 'math' | 'caption' | 'item' | 'figure' | 'code'
+  level?: number
+  source: string
+  target: string
+  /** 插图相对路径（tex 模式；经 /api/tasks/{id}/figimage 取图） */
+  images?: string[]
+}
+
+export interface ParagraphsResult {
+  ready: boolean
+  /** tex = arXiv 源码级抽取（含 LaTeX 公式与引用标记）；pdf = PDF 文本块抽取 */
+  mode?: 'tex' | 'pdf'
+  /** 作者自定义宏（KaTeX 格式） */
+  macros?: Record<string, string>
+  pairs: ParagraphPair[]
+  source_count: number
+  target_count: number
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string
 }
 
 export interface UploadOptions {
@@ -103,7 +136,16 @@ export interface UploadOptions {
   engine: 'auto' | 'arxiv' | 'babeldoc'
   arxiv_id: string
   line_spread: number
+  polish: string
 }
+
+/** 翻译风格预设（与后端 prompt_presets.POLISH_PRESETS 对应） */
+export const POLISH_OPTIONS = [
+  { value: 'default', label: '默认（学术规范）' },
+  { value: 'faithful', label: '忠实直译' },
+  { value: 'polished', label: '流畅润色' },
+  { value: 'plain', label: '通俗易懂' },
+]
 
 async function handle<T>(resp: Response): Promise<T> {
   if (!resp.ok) {
@@ -166,6 +208,28 @@ export const api = {
     fetch(`/api/tasks/${id}/retry`, { method: 'POST' }).then(r => handle<Task>(r)),
   deleteTask: (id: number) =>
     fetch(`/api/tasks/${id}`, { method: 'DELETE' }).then(r => handle<{ ok: boolean }>(r)),
+  archiveTask: (id: number, archived: boolean) =>
+    fetch(`/api/tasks/${id}/archive`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived }),
+    }).then(r => handle<{ ok: boolean; archived: boolean }>(r)),
+
+  // 逐段对照 + AI 阅读助手
+  getParagraphs: (id: number) =>
+    fetch(`/api/tasks/${id}/paragraphs`).then(r => handle<ParagraphsResult>(r)),
+  chat: (id: number, messages: ChatMessage[]) =>
+    fetch(`/api/tasks/${id}/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+    }).then(r => handle<{ reply: string }>(r)),
+  getChatHistory: (id: number) =>
+    fetch(`/api/tasks/${id}/chat/history`)
+      .then(r => handle<{ messages: ChatMessage[] }>(r)),
+  saveChatHistory: (id: number, messages: ChatMessage[]) =>
+    fetch(`/api/tasks/${id}/chat/history`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+    }).then(r => handle<{ ok: boolean }>(r)),
 }
 
 /** 订阅任务 SSE 事件流，返回 EventSource 便于关闭。 */export function openTaskEvents(

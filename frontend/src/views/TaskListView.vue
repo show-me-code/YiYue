@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, genFileId } from 'element-plus'
 import type { UploadInstance, UploadRawFile } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
-import { api, type Profile, type Task, type UploadOptions } from '../api/client'
+import { api, POLISH_OPTIONS, type Profile, type Task, type UploadOptions } from '../api/client'
 import { finishLabel, fmtDuration, fmtLocalTime } from '../utils/time'
 
 const router = useRouter()
@@ -28,7 +28,25 @@ const form = reactive<UploadOptions>({
   engine: 'auto',
   arxiv_id: '',
   line_spread: 1.3,
+  polish: 'default',
 })
+
+/** 表单选项持久化：切换页面（组件销毁重建）后保持上次的选择 */
+const FORM_KEY = 'yiyue-task-form'
+
+function saveForm() {
+  const { profile_id: _pid, ...rest } = form  // 配置档 id 每次按当前列表重选
+  localStorage.setItem(FORM_KEY, JSON.stringify(rest))
+}
+
+function restoreForm() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FORM_KEY) ?? '{}')
+    for (const [k, v] of Object.entries(saved)) {
+      if (k in form && k !== 'profile_id') (form as Record<string, unknown>)[k] = v
+    }
+  } catch { /* 忽略坏数据 */ }
+}
 
 const STATUS_META: Record<Task['status'], { label: string; type: 'info' | 'primary' | 'warning' | 'success' | 'danger' }> = {
   queued: { label: '排队中', type: 'info' },
@@ -37,6 +55,30 @@ const STATUS_META: Record<Task['status'], { label: string; type: 'info' | 'prima
   done: { label: '已完成', type: 'success' },
   failed: { label: '失败', type: 'danger' },
   cancelled: { label: '已取消', type: 'info' },
+}
+
+/** 闭环验证未通过的"已完成"改为红色醒目提示 */
+function statusMeta(t: Task) {
+  if (t.status === 'done' && t.verification && t.verification.verdict !== '通过') {
+    return { label: '已完成 · 需复核', type: 'danger' as const }
+  }
+  return STATUS_META[t.status]
+}
+
+/** 主列表只显示未归档任务 */
+const visibleTasks = computed(() => tasks.value.filter(t => !t.archived))
+
+/** 卡片主标题：中文标题 > 英文标题 > 文件名 */
+function displayTitle(t: Task): string {
+  return t.title_zh || t.title_en || t.filename
+}
+function subTitle(t: Task): string | null {
+  if (t.title_zh && t.title_en) return t.title_en
+  if (t.title_zh) return t.filename
+  return null
+}
+function polishLabel(key: string): string {
+  return POLISH_OPTIONS.find(o => o.value === key)?.label ?? key
 }
 
 function fmtSize(n: number): string {
@@ -50,6 +92,7 @@ async function refresh() {
 }
 
 onMounted(async () => {
+  restoreForm()
   profiles.value = await api.listProfiles().catch(() => [])
   if (profiles.value.length) {
     form.profile_id = (profiles.value.find(p => p.is_default) ?? profiles.value[0]).id
@@ -57,6 +100,7 @@ onMounted(async () => {
   await refresh()
   timer = window.setInterval(refresh, 2500)
 })
+watch(form, saveForm, { deep: true })
 onBeforeUnmount(() => window.clearInterval(timer))
 
 function onFileChange(files: File[]) {
@@ -96,6 +140,11 @@ async function cancel(t: Task) { await api.cancelTask(t.id); refresh() }
 async function retry(t: Task) { await api.retryTask(t.id); refresh() }
 async function remove(t: Task) {
   await api.deleteTask(t.id)
+  refresh()
+}
+async function archive(t: Task) {
+  await api.archiveTask(t.id, true)
+  ElMessage.success('已归档，可在左侧「归档」页查看')
   refresh()
 }
 function openReader(t: Task) { router.push(`/reader/${t.id}`) }
@@ -218,6 +267,15 @@ function progressPct(t: Task): number {
               </div>
             </el-form-item>
           </el-col>
+          <el-col :span="8">
+            <el-form-item label="翻译风格">
+              <el-select v-model="form.polish" style="width:100%">
+                <el-option v-for="o in POLISH_OPTIONS" :key="o.value"
+                  :label="o.label" :value="o.value" />
+              </el-select>
+              <div class="muted">润色/直译风格注入提示词，两条引擎都生效</div>
+            </el-form-item>
+          </el-col>
         </el-row>
         <el-form-item label="术语表">
           <el-switch v-model="form.use_glossary" />
@@ -233,10 +291,14 @@ function progressPct(t: Task): number {
       </el-form>
     </div>
 
-    <div class="card" v-for="t in tasks" :key="t.id">
+    <div class="card" v-for="t in visibleTasks" :key="t.id">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-        <el-tag :type="STATUS_META[t.status].type">{{ STATUS_META[t.status].label }}</el-tag>
-        <b>{{ t.filename }}</b>
+        <el-tag :type="statusMeta(t).type">{{ statusMeta(t).label }}</el-tag>
+        <span class="task-title">
+          <b>{{ displayTitle(t) }}</b>
+          <div v-if="subTitle(t)" class="muted title-sub">{{ subTitle(t) }}</div>
+        </span>
+        <el-tag v-for="tp in t.topics" :key="tp" size="small" effect="plain" type="info">{{ tp }}</el-tag>
         <span class="muted">{{ t.page_count }} 页 · {{ fmtSize(t.size_bytes) }} · {{ t.lang_in }}→{{ t.lang_out }}</span>
         <el-tag v-if="t.cache_hit" size="small" type="success">缓存命中</el-tag>
         <el-tag v-if="t.arxiv_id" size="small" type="warning">arXiv {{ t.arxiv_id }}</el-tag>
@@ -245,10 +307,9 @@ function progressPct(t: Task): number {
           原位排版（PDF 模式，未走 LaTeX）
         </el-tag>
         <el-tag v-else-if="t.engine === 'babeldoc'" size="small" type="info">原位排版</el-tag>
-        <el-tag
-          v-if="t.verification" size="small"
-          :type="t.verification.verdict === '通过' ? 'success' : 'warning'"
-        >闭环验证：{{ t.verification.verdict }}</el-tag>
+        <el-tag v-if="t.polish && t.polish !== 'default'" size="small" effect="plain">
+          {{ polishLabel(t.polish) }}
+        </el-tag>
         <span v-if="t.pages" class="muted">页码 {{ t.pages }}</span>
         <span v-if="finishLabel(t.status)" class="muted" :title="`创建于 ${fmtLocalTime(t.created_at)}`">
           {{ finishLabel(t.status) }} {{ fmtLocalTime(t.finished_at) }}
@@ -258,12 +319,10 @@ function progressPct(t: Task): number {
         <el-button v-if="t.status === 'done'" size="small" type="primary" @click="openReader(t)">对照阅读</el-button>
         <el-button v-if="['queued','translating','merging'].includes(t.status)" size="small" @click="cancel(t)">取消</el-button>
         <el-button v-if="['failed','cancelled','done'].includes(t.status)" size="small" @click="retry(t)">重试</el-button>
-        <el-button v-if="t.status === 'done'" size="small">
-          <a :href="t.outputs.find(o=>o.kind==='mono')?.url" target="_blank" style="text-decoration:none;color:inherit">译文 PDF</a>
-        </el-button>
         <el-button v-if="t.status === 'done' && t.outputs.some(o=>o.kind==='dual')" size="small">
           <a :href="t.outputs.find(o=>o.kind==='dual')?.url" target="_blank" style="text-decoration:none;color:inherit">双语 PDF</a>
         </el-button>
+        <el-button v-if="t.status === 'done'" size="small" @click="archive(t)">归档</el-button>
         <el-button size="small" type="danger" text @click="remove(t)">删除</el-button>
       </div>
 
@@ -284,3 +343,17 @@ function progressPct(t: Task): number {
     </div>
   </div>
 </template>
+
+<style scoped>
+.task-title {
+  min-width: 0;
+}
+.title-sub {
+  font-size: 12px;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 560px;
+}
+</style>

@@ -28,7 +28,7 @@ from babeldoc.glossary import Glossary
 from babeldoc.translator.translator import OpenAITranslator
 
 from app.models import Profile
-from app.services import tex_translate
+from app.services import prompt_presets, tex_translate
 from app.services.anthropic_translator import AnthropicTranslator
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,7 @@ class RunnerOptions:
     scan_mode: str = "off"  # off|workaround|auto
     glossaries: list[Glossary] | None = None
     auto_extract_glossary: bool = False
+    polish: str = "default"  # 翻译风格预设（prompt_presets.POLISH_PRESETS 的键）
 
 
 _layout_model: DocLayoutModel | None = None
@@ -157,7 +158,8 @@ def apply_rate_limit(profile: Profile) -> None:
 
 
 def apply_arxiv_prompts(translator, profile: Profile, lang_out: str,
-                        glossary_entries: list[dict] | None = None) -> bool:
+                        glossary_entries: list[dict] | None = None,
+                        polish: str = "default") -> bool:
     """让 arXiv 源码直译路径也用上「自定义系统提示词 + 术语表 + 占位符规则」。
 
     背景（实测）：arXiv 路径直接调 `translator.translate(text)`，BabelDOC 的
@@ -179,7 +181,8 @@ def apply_arxiv_prompts(translator, profile: Profile, lang_out: str,
     "Treat next line as plain text input"，把术语表塞进 user 有被当成待翻译正文的风险。
     """
     system = tex_translate.system_prompt_for(
-        lang_out, getattr(profile, "custom_system_prompt", None))
+        lang_out, prompt_presets.effective_custom_prompt(
+            getattr(profile, "custom_system_prompt", None), polish))
     pairs = [(e.get("source"), e.get("target")) for e in (glossary_entries or [])
              if e.get("source") and e.get("target")]
     if pairs:
@@ -242,7 +245,8 @@ def build_translation_config(profile: Profile, opts: RunnerOptions) -> Translati
         auto_enable_ocr_workaround=(opts.scan_mode == "auto"),
         glossaries=opts.glossaries or None,
         auto_extract_glossary=opts.auto_extract_glossary,
-        custom_system_prompt=profile.custom_system_prompt or None,
+        custom_system_prompt=prompt_presets.effective_custom_prompt(
+            profile.custom_system_prompt, getattr(opts, "polish", "default")),
     )
     # CLI 同款调用：把字体映射器挂到模型上
     getattr(model, "init_font_mapper", lambda _c: None)(config)

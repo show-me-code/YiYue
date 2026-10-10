@@ -31,7 +31,8 @@ def test_build_translation_config_mapping(stub_model, tmp_path):
     assert cfg.ocr_workaround is True
     assert cfg.skip_scanned_detection is True
     assert cfg.auto_enable_ocr_workaround is False
-    assert cfg.custom_system_prompt == "Be terse."
+    # 自定义规范与默认风格预设合并注入：预设在先，用户规范收尾
+    assert cfg.custom_system_prompt.endswith("Be terse.")
     assert cfg.watermark_output_mode.value == "no_watermark"
     assert cfg.output_dir == tmp_path / "out"
     # 排版选项保持引擎默认：段落修复由 babeldoc 补丁（scripts/apply_babeldoc_patches.py）承担

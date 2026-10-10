@@ -503,34 +503,49 @@ def _split_chunk(chunk: str) -> list[str]:
     return [chunk]
 
 
+def _split_recover(translator, chunk: str, is_caption: bool,
+                   depth: int = 0, max_depth: int = 2) -> str | None:
+    """递归拆分恢复：块 → 两半 → 各半再拆……最多 max_depth 层（块→半→四分之一）。
+
+    实测失败几乎都是"某处占位符被写坏"；块越大越容易出现一处坏点，
+    拆得足够细时坏点所在的小块才可能单独通过校验。全部失败返回 None。
+    """
+    if len(chunk) < 300 or depth >= max_depth:
+        return None
+    halves = _split_chunk(chunk)
+    if len(halves) != 2:
+        return None
+    scratch: dict = {}
+    pieces: list[str] = []
+    for half in halves:
+        piece = _translate_chunk(translator, half, scratch, is_caption=is_caption)
+        if piece is None:
+            piece = _split_recover(translator, half, is_caption,
+                                   depth + 1, max_depth)
+            if piece is None:
+                return None
+        pieces.append(piece)
+    return "\n\n".join(pieces)
+
+
 def _chunk_worker(translator, is_caption: bool):
     """构造正文块任务：统计用**局部字典**收集，回主线程再合并。
 
     `_translate_chunk` 里是 `stats[key] = stats.get(key, 0) + 1`，多线程直接共享
     一个 dict 会丢计数。
 
-    整块两次都不合格时，再把长块劈成两半各试一次：实测失败几乎都是"某处占位符
-    被写坏"，劈开后两半往往都能过（2607.03728 就有一整段正文因此得以翻译）。
+    整块两次都不合格时，再递归拆半恢复（最多拆到四分之一）：实测失败几乎都是
+    "某处占位符被写坏"，拆细后往往能过（2607.03728 就有整段正文因此得以翻译）。
     """
     def worker(chunk: str):
         local: dict = {}
         result = _translate_chunk(translator, chunk, local, is_caption=is_caption)
-        if result is None and not is_caption and len(chunk) >= 600:
-            halves = _split_chunk(chunk)
-            if len(halves) == 2:
-                scratch: dict = {}
-                pieces: list[str] = []
-                for half in halves:
-                    piece = _translate_chunk(translator, half, scratch,
-                                             is_caption=False)
-                    if piece is None:
-                        pieces = []
-                        break
-                    pieces.append(piece)
-                if pieces:
-                    # 劈开成功了：丢掉"整块失败"的计数，改为记一次"拆分恢复"
-                    return "\n\n".join(pieces), {"chunks_split_recovered": 1}
-                # 劈开也不行：保留整块的失败计数（不重复计 scratch）
+        if result is None and not is_caption:
+            recovered = _split_recover(translator, chunk, is_caption)
+            if recovered is not None:
+                # 拆分成功了：丢掉"整块失败"的计数，改为记一次"拆分恢复"
+                return recovered, {"chunks_split_recovered": 1}
+            # 拆分也不行：保留整块的失败计数
         return result, local
     return worker
 

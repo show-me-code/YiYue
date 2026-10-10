@@ -47,3 +47,13 @@ class TaskOptionsIn(BaseModel):
     engine: str = "auto"  # auto|arxiv|babeldoc
     arxiv_id: str | None = None
     line_spread: float = 1.3  # 行距倍数（1.0=跟原文一致；中文排版惯例约 1.3）
+    polish: str = "default"  # 翻译风格预设
+
+
+class ChatMessage(BaseModel):
+    role: str  # user | assistant
+    content: str
+
+
+class ChatIn(BaseModel):
+    messages: list[ChatMessage]

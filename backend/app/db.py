@@ -56,6 +56,13 @@ def _migrate() -> None:
             # 旧任务的产出都是 1.0 行距；列描述"想要的行距"，重跑即按 1.3 出图
             conn.exec_driver_sql(
                 "UPDATE task SET line_spread=1.3 WHERE line_spread IS NULL")
+    for col, ddl in (("title_en", "VARCHAR"), ("title_zh", "VARCHAR"),
+                     ("topics_json", "VARCHAR"),
+                     ("archived", "BOOLEAN DEFAULT 0 NOT NULL"),
+                     ("polish", "VARCHAR DEFAULT 'default' NOT NULL")):
+        if col not in tcols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(f"ALTER TABLE task ADD COLUMN {col} {ddl}")
 
 
 def get_session():

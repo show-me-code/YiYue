@@ -688,7 +688,8 @@ def test_apply_arxiv_prompts_rewrites_system_and_user(monkeypatch):
     assert changed is True
 
     messages = tr.prompt("Hello [[M0]]")
-    assert messages[0]["content"].startswith("学术翻译规范")
+    # 默认风格预设（学术规范）在前，用户自定义规范在后
+    assert "学术翻译规范" in messages[0]["content"]
     assert "[[M12]]" in messages[0]["content"]        # 结构规则也带上了
     assert "probe → 探针" in messages[0]["content"]   # 术语在 system 里
     assert "layer → 层" in messages[0]["content"]
@@ -872,6 +873,21 @@ def test_chunk_worker_keeps_failure_when_split_also_fails():
     out, local = tex_translate._chunk_worker(AlwaysBad(), False)(long_chunk)
     assert out is None
     assert local["chunks_untranslated"] >= 1
+
+
+def test_chunk_worker_recovers_at_quarter_level():
+    """整块和半块都失败、四分之一块才成功：递归拆分必须能恢复。"""
+    class VeryPicky:
+        def translate(self, text, ignore_cache=False):
+            if len(text) > 300:              # 整块(~920)与半块(~460)都会失败
+                return text + " {broken"
+            return "译 " + text
+
+    long_chunk = "English sentence here. " * 40
+    out, local = tex_translate._chunk_worker(VeryPicky(), False)(long_chunk)
+    assert out is not None
+    assert local.get("chunks_split_recovered") == 1
+    assert "chunks_untranslated" not in local
 
 
 # ---------- 任务时间：ISO 格式 + 耗时（前端按本地时区显示） ----------

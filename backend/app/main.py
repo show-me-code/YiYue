@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app import config
-from app.api import assets, files, glossary, profiles, tasks
+from app.api import assets, files, glossary, profiles, reader, tasks
 from app.db import init_db
 from app.services.babeldoc_runner import ensure_init, patches_applied
 from app.services.orchestrator import manager, recover_interrupted
@@ -23,9 +23,12 @@ for noisy in ("httpx", "httpcore", "babeldoc.assets.assets"):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.services import enrich
+
     init_db()
     recover_interrupted()
     ensure_init()
+    enrich.backfill_async()  # 后台回填历史任务的标题/主题词
     if not patches_applied():
         logging.getLogger(__name__).warning(
             "BabelDOC 排版修复补丁未应用，翻译可能出现文字断裂/重叠。"
@@ -49,8 +52,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    for r in (profiles.router, glossary.router, tasks.router, files.router,
-              assets.router):
+    for r in (profiles.router, glossary.router, tasks.router, reader.router,
+              files.router, assets.router):
         app.include_router(r)
 
     @app.get("/api/health")

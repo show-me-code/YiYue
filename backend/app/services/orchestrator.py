@@ -358,6 +358,7 @@ class TaskManager:
             cache.register_cache(task.cache_key, task_id)
         self.broadcast(task_id, {"type": "done", "outputs": outputs,
                                  "engine_used": "babeldoc"})
+        self._enrich(task_id)
 
     @staticmethod
     def _line_spread(task: Task) -> float:
@@ -483,7 +484,8 @@ class TaskManager:
             if task.glossary_snapshot_json else []
         )
         babeldoc_runner.apply_arxiv_prompts(
-            translator, profile, task.lang_out, glossary_entries)
+            translator, profile, task.lang_out, glossary_entries,
+            polish=getattr(task, "polish", "default"))
         files = await asyncio.to_thread(
             arxiv_engine.collect_doc_files, chosen, texs
         )
@@ -619,6 +621,7 @@ class TaskManager:
             cache.register_cache(task.cache_key, task_id)
         self.broadcast(task_id, {"type": "done", "outputs": outputs,
                                  "engine_used": "arxiv"})
+        self._enrich(task_id)
 
     # ---------- 段翻译 ----------
     async def _translate_part_with_retry(self, task: Task, profile: Profile,
@@ -653,6 +656,7 @@ class TaskManager:
             scan_mode=task.scan_mode,
             glossaries=glossaries,
             auto_extract_glossary=task.auto_extract_glossary,
+            polish=getattr(task, "polish", "default"),
         )
         config_obj = await asyncio.to_thread(
             babeldoc_runner.build_translation_config, profile, opts
@@ -709,6 +713,13 @@ class TaskManager:
     def remove_task_files(self, task_id: int) -> None:
         shutil.rmtree(config.TASKS_DIR / str(task_id), ignore_errors=True)
         cache.remove_task_from_cache(task_id)
+
+    @staticmethod
+    def _enrich(task_id: int) -> None:
+        """任务完成后后台补齐论文标题/主题词（best-effort，LLM 慢也不阻塞）。"""
+        from app.services import enrich
+
+        enrich.enrich_task_async(task_id)
 
 
 manager = TaskManager()

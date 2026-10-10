@@ -60,10 +60,16 @@ def _task_json(task: Task, outputs: list[TaskOutput] | None = None) -> dict:
         "engine": getattr(task, "engine", "auto"),
         "engine_used": getattr(task, "engine_used", None),
         "line_spread": getattr(task, "line_spread", 1.3),
+        "polish": getattr(task, "polish", "default"),
         "arxiv_id": getattr(task, "arxiv_id", None),
         "auto_extract_glossary": task.auto_extract_glossary,
         "cache_hit": task.cache_key is not None and task.status == "done"
                      and task.error == "cache",
+        "title_en": getattr(task, "title_en", None),
+        "title_zh": getattr(task, "title_zh", None),
+        "topics": json.loads(task.topics_json)
+                  if getattr(task, "topics_json", None) else [],
+        "archived": bool(getattr(task, "archived", False)),
         "progress": progress,
         "verification": verification,
         "created_at": timeutil.iso(task.created_at),
@@ -101,6 +107,7 @@ async def create_task(
     engine: str = Form("auto"),
     arxiv_id: str = Form(""),
     line_spread: float = Form(1.3),
+    polish: str = Form("default"),
     s: Session = Depends(get_session),
 ):
     opts = TaskOptionsIn(
@@ -108,12 +115,15 @@ async def create_task(
         pages=pages or None, part_size=part_size, scan_mode=scan_mode,
         auto_extract_glossary=auto_extract_glossary, use_glossary=use_glossary,
         engine=engine or "auto", arxiv_id=arxiv_id or None,
-        line_spread=line_spread,
+        line_spread=line_spread, polish=polish,
     )
     if opts.scan_mode not in ("off", "workaround", "auto"):
         raise HTTPException(400, "scan_mode 无效")
     if opts.engine not in ("auto", "arxiv", "babeldoc"):
         raise HTTPException(400, "engine 无效")
+    from app.services.prompt_presets import POLISH_PRESETS
+    if opts.polish not in POLISH_PRESETS:
+        raise HTTPException(400, "翻译风格预设无效")
     if not 1.0 <= opts.line_spread <= 2.0:
         raise HTTPException(400, "行距倍数需在 1.0 ~ 2.0 之间")
     if not s.get(Profile, opts.profile_id):
@@ -182,6 +192,7 @@ async def create_task(
         "arxiv_id": resolved_arxiv_id or "",
         "pipeline_version": cache.PIPELINE_VERSION,
         "line_spread": round(float(opts.line_spread), 3),
+        "polish": opts.polish,  # 风格影响译文，必须进缓存键
     }
     cache_key = cache.compute_cache_key(file_hash, cache_options)
 
@@ -196,6 +207,7 @@ async def create_task(
         engine=opts.engine,
         arxiv_id=resolved_arxiv_id,
         line_spread=opts.line_spread,
+        polish=opts.polish,
         auto_extract_glossary=opts.auto_extract_glossary,
         glossary_snapshot_json=json.dumps(snapshot, ensure_ascii=False)
         if snapshot else None,
@@ -232,6 +244,9 @@ async def create_task(
             s.add(task)
             s.commit()
             s.refresh(task)
+            from app.services import enrich
+
+            enrich.enrich_task_async(task.id)  # 缓存命中也补齐标题/主题
             outs = s.exec(
                 select(TaskOutput).where(TaskOutput.task_id == task.id)
             ).all()
@@ -278,6 +293,18 @@ async def cancel_task(task_id: int, s: Session = Depends(get_session)):
     if task.status in ("queued", "translating", "merging"):
         await manager.cancel(task_id)
     return {"ok": True}
+
+
+@router.post("/{task_id}/archive")
+def archive_task(task_id: int, body: dict, s: Session = Depends(get_session)):
+    """归档/取消归档：归档后从主列表隐藏，进「归档」页。"""
+    task = s.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    task.archived = bool(body.get("archived", True))
+    s.add(task)
+    s.commit()
+    return {"ok": True, "archived": task.archived}
 
 
 @router.post("/{task_id}/retry")

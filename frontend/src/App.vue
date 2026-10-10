@@ -1,5 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
+
+const route = useRoute()
+/** 阅读页是独立全屏界面，不显示任务/配置侧边栏 */
+const isReader = computed(() => route.path.startsWith('/reader'))
 
 const asset = ref<{ ready: boolean | null; warming: boolean; message: string }>({
   ready: null, warming: false, message: '检查中…',
@@ -21,11 +26,12 @@ onMounted(checkAssets)
 </script>
 
 <template>
-  <div class="layout">
-    <aside class="sidebar">
+  <div class="layout" :class="{ 'reader-mode': isReader }">
+    <aside v-if="!isReader" class="sidebar">
       <div class="brand">译阅</div>
       <el-menu :default-active="$route.path" router>
         <el-menu-item index="/">翻译任务</el-menu-item>
+        <el-menu-item index="/archive">归档</el-menu-item>
         <el-menu-item index="/settings">API 配置</el-menu-item>
         <el-menu-item index="/glossary">术语表</el-menu-item>
       </el-menu>

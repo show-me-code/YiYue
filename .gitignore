@@ -15,6 +15,13 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 
+# 生成物：DOCX 由 docs/交付说明书.md 经 scripts/md_to_docx.py 生成，不入库
+docs/交付说明书.docx
+
+# 本地审计/调试草稿与抓取转储（不对外）
+_audit/
+_*.txt
+
 # 本地一次性脚本与提交信息草稿（不要进仓库）
 _*.py
 COMMIT_MSG_*.txt

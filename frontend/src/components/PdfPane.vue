@@ -19,6 +19,8 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   (e: 'page-change', n: number): void
+  /** 连续滚动位置（当前页 + 页内偏移比例），用于双栏页锚点同步 */
+  (e: 'scroll-pos', pos: { page: number; ratio: number }): void
   (e: 'loaded', total: number): void
   (e: 'error', message: string): void
 }>()
@@ -37,7 +39,11 @@ let renderTasks = new Map<number, any>()
 const renderedPages = new Set<number>()
 let pageTops: number[] = []
 let fitScale = 1
+/** 每页在 scale=1 下的尺寸：加载时一次性取出，预置 slot 真实高度 */
+let pageDims: { w: number; h: number }[] = []
 let observer: IntersectionObserver | null = null
+let resizeObs: ResizeObserver | null = null
+let resizeTimer: ReturnType<typeof setTimeout> | null = null
 let loadingTask: any = null
 /** 载入代次：增量合并会频繁 reload，旧请求晚到的结果必须丢弃 */
 let loadSeq = 0
@@ -58,7 +64,14 @@ async function load() {
   loading.value = true
   errorText.value = ''
   try {
-    const task = pdfjsLib.getDocument({ url: props.url })
+    const task = pdfjsLib.getDocument({
+      url: props.url,
+      // 译文 PDF 用 Tectonic + Fandol 生成，汉字是 CID-keyed 字体：
+      // 不带 cMaps 时 pdf.js 解不出字形，整段中文直接消失
+      cMapUrl: '/pdfjs/cmaps/',
+      cMapPacked: true,
+      standardFontDataUrl: '/pdfjs/standard_fonts/',
+    })
     loadingTask = task
     const loaded = await task.promise
     if (seq !== loadSeq) { void task.destroy(); return }
@@ -70,10 +83,23 @@ async function load() {
     const w = first.getViewport({ scale: 1 }).width
     const el0 = container.value
     if (el0) fitScale = Math.max(0.2, (el0.clientWidth - 24) / w)
-    await nextFrame()
+    // 预置每页真实高度：懒渲染只延迟画布绘制，布局高度不再随渲染
+    // 增长而漂移——否则同步滚动按滚动比例定位时，目标栏的总高度还在
+    // 变化，落点会错（旧的 200px 占位高度会让对侧"弹回"前面的页）
+    pageDims = []
+    pageDims[1] = { w, h: first.getViewport({ scale: 1 }).height }
+    for (let i = 2; i <= doc.numPages; i++) {
+      const pg = await doc.getPage(i)
+      if (seq !== loadSeq) return
+      const vp = pg.getViewport({ scale: 1 })
+      pageDims[i] = { w: vp.width, h: vp.height }
+    }
+    await nextFrame()  // 等 slot 节点渲染出来，slotRefs 才有值
     if (seq !== loadSeq) return
+    applyHeights()
     observeSlots()
     renderVisible()
+    watchResize()
     // loaded 放在 slot 就绪之后：订阅方收到后立刻 goToPage 才有节点可跳
     emit('loaded', docTotal.value)
   } catch (e) {
@@ -94,6 +120,8 @@ function nextFrame(): Promise<void> {
 function destroyDoc() {
   observer?.disconnect()
   observer = null
+  resizeObs?.disconnect()
+  resizeObs = null
   for (const t of renderTasks.values()) t?.cancel?.()
   renderTasks = new Map()
   renderedPages.clear()
@@ -101,12 +129,21 @@ function destroyDoc() {
   docTotal.value = 0
   docPages.value = 0
   pageTops = []
+  pageDims = []
   if (loadingTask) { loadingTask.destroy?.(); loadingTask = null }
   doc = null
 }
 
 function pageScale(): number {
   return fitScale * props.zoom
+}
+
+/** 按缓存的页面尺寸预置所有 slot 高度（缩放变化后也要重设）。 */
+function applyHeights() {
+  for (const [i, el] of slotRefs.entries()) {
+    const dim = pageDims[i]
+    if (dim) el.style.height = `${Math.floor(dim.h * pageScale())}px`
+  }
 }
 
 function observeSlots() {
@@ -170,15 +207,41 @@ function recordTop(i: number, height: number) {
 function onScroll() {
   const el = container.value
   if (!el) return
-  // 用 slot 的实际 offsetTop 找当前页，比缓存更可靠
+  // 注意：slotRefs 是 Map，插入序不保证是页码序（v-for 键变化重挂载时
+  // Vue 的 ref 回调可能以倒序注册）。当前页计算依赖顺序，必须显式排序。
+  const ordered = [...slotRefs.entries()].sort((a, b) => a[0] - b[0])
   let current = 1
-  for (const [i, node] of slotRefs.entries()) {
+  for (const [i, node] of ordered) {
     if (node.offsetTop - el.scrollTop <= el.clientHeight * 0.35) current = Math.max(current, i)
     else break
   }
   docPages.value = Math.min(current, docTotal.value)
   evictFar(current)
   emit('page-change', current)
+  emit('scroll-pos', currentPos(el))
+}
+
+/** 当前阅读位置：以"35% 视口线"为准，返回页码 + 页内偏移比例（0~1）。 */
+function currentPos(el: HTMLElement): { page: number; ratio: number } {
+  const page = Math.max(1, docPages.value)
+  const node = slotRefs.get(page)
+  if (!node) return { page, ratio: 0 }
+  const line = el.scrollTop + el.clientHeight * 0.35
+  const h = node.offsetHeight || 1
+  const ratio = Math.min(1, Math.max(0, (line - node.offsetTop) / h))
+  return { page, ratio }
+}
+
+/** 滚动到 pageFloat 指定的位置（3.4 = 第 3 页的 40% 处）。页锚点同步用。 */
+function scrollToPos(pageFloat: number) {
+  const el = container.value
+  if (!el || !docTotal.value) return
+  const p = Math.min(docTotal.value, Math.max(1, Math.floor(pageFloat)))
+  const node = slotRefs.get(p)
+  if (!node) return
+  const frac = Math.min(0.999, Math.max(0, pageFloat - p))
+  el.scrollTop = Math.max(0,
+    node.offsetTop + frac * (node.offsetHeight || 0) - el.clientHeight * 0.35)
 }
 
 /** 回收远离当前页的画布：连续滚动长文档时画布个数必须有上限。 */
@@ -218,6 +281,7 @@ function clearRendered() {
     el.innerHTML = ''
     el.style.height = ''
   }
+  applyHeights()  // 高度用当前缩放重新预置，而不是回到 200px 占位
   renderVisible()
 }
 
@@ -234,12 +298,30 @@ function renderVisible() {
   }
 }
 
+/** 容器宽度变化（切换单/双栏、开关 AI 面板、窗口缩放）时重算适配比例。 */
+function watchResize() {
+  const el = container.value
+  if (!el || resizeObs) return
+  resizeObs = new ResizeObserver(() => {
+    if (resizeTimer) clearTimeout(resizeTimer)
+    resizeTimer = setTimeout(() => {
+      if (!doc || !pageDims[1]) return
+      const newFit = Math.max(0.2, (el.clientWidth - 24) / pageDims[1].w)
+      if (Math.abs(newFit - fitScale) < 0.01) return
+      fitScale = newFit
+      clearRendered()
+    }, 150)
+  })
+  resizeObs.observe(el)
+}
+
 watch(() => props.url, load)
 watch(() => props.zoom, () => {
   clearRendered()
 })
 
-defineExpose({ goToPage, reload: load, clearRendered, currentPage: () => docPages.value, docTotal })
+defineExpose({ goToPage, reload: load, clearRendered, scrollToPos,
+  currentPage: () => docPages.value, docTotal })
 
 onMounted(load)
 onBeforeUnmount(destroyDoc)
@@ -250,7 +332,7 @@ onBeforeUnmount(destroyDoc)
     <div v-if="!url && !errorText" class="pane-empty">等待输出…</div>
     <div v-else-if="errorText" class="pane-empty error">{{ errorText }}</div>
     <div v-else ref="container" class="pane-scroll" @scroll.passive="onScroll">
-      <div v-for="i in displayTotal" :key="`${i}-${docTotal}`" :data-page="i"
+      <div v-for="i in displayTotal" :key="i" :data-page="i"
         :ref="el => setSlotRef(i, el)" class="page-slot">
       </div>
     </div>

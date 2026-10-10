@@ -60,6 +60,11 @@ class Task(SQLModel, table=True):
     glossary_snapshot_json: str | None = None  # 术语快照，保证可复现
     cache_key: str | None = None
     progress_json: str | None = None
+    title_en: str | None = None   # 论文英文标题（tex 源码或文件名推断）
+    title_zh: str | None = None   # 中文标题（译后源码或 LLM 翻译）
+    topics_json: str | None = None  # JSON list[str]：LLM 总结的主题词
+    archived: bool = False        # 归档后在主列表隐藏，进「归档」页
+    polish: str = "default"       # 翻译风格预设（prompt_presets.POLISH_PRESETS 的键）
     created_at: datetime = Field(default_factory=utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None

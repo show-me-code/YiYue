@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/** 双栏对照阅读器：左原文右译文，按页码锚点同步滚动与缩放。 */
+/** 双栏对照阅读器：左原文右译文，按比例同步滚动与缩放。 */
 import { computed, ref, watch } from 'vue'
 import PdfPane from './PdfPane.vue'
 
@@ -22,7 +22,6 @@ const leftPage = ref(1)
 const rightPage = ref(1)
 const leftTotal = ref(0)
 const rightTotal = ref(0)
-const syncing = ref(false)
 
 const leftPane = ref<InstanceType<typeof PdfPane> | null>(null)
 const rightPane = ref<InstanceType<typeof PdfPane> | null>(null)
@@ -32,25 +31,34 @@ let pendingRestore: number | null = null
 const rightUrl = computed(() => props.monoUrl)
 const displayPage = computed(() => Math.min(rightPage.value, Math.max(1, props.pagesDone)))
 
-function fromLeft(n: number) {
-  leftPage.value = n
-  if (syncEnabled.value && mode.value === 'dual' && !syncing.value) {
-    syncing.value = true
-    rightPane.value?.goToPage(n)
-    rightPage.value = n
-    syncing.value = false
-  }
+/**
+ * 同步滚动：页锚点对齐——左栏"第 N 页的 40% 处"映射到右栏对应页的 40% 处
+ * （页码按两边总页数换算：17 页原文的第 9 页 ≈ 19 页译文的第 10 页）。
+ * 比纯滚动比例更稳：两栏翻页节奏一致，速度感受相同。
+ * 抑制窗口：程序化设置对方 scrollTop 会异步触发对方的 scroll 事件，
+ * 若不加窗（旧实现），回弹事件被当成用户滚动又同步回来，两栏互相拉扯乱跳。
+ */
+const suppressUntil = { left: 0, right: 0 }
+
+function syncFrom(side: 'left' | 'right', pos: { page: number; ratio: number }) {
+  if (!syncEnabled.value || mode.value !== 'dual') return
+  if (Date.now() < suppressUntil[side]) return
+  const fromTotal = side === 'left' ? leftTotal.value : rightTotal.value
+  const toTotal = side === 'left' ? rightTotal.value : leftTotal.value
+  if (!fromTotal || !toTotal) return
+  const other = side === 'left' ? 'right' : 'left'
+  suppressUntil[other] = Date.now() + 300
+  const pane = other === 'left' ? leftPane.value : rightPane.value
+  // 页码按总页数比例换算 + 页内偏移保持
+  const target = (pos.page - 1 + pos.ratio) / fromTotal * toTotal + 1
+  pane?.scrollToPos(target)
 }
 
-function fromRight(n: number) {
-  rightPage.value = n
-  if (syncEnabled.value && mode.value === 'dual' && !syncing.value) {
-    syncing.value = true
-    leftPane.value?.goToPage(n)
-    leftPage.value = n
-    syncing.value = false
-  }
-}
+function fromLeftScroll(pos: { page: number; ratio: number }) { syncFrom('left', pos) }
+function fromRightScroll(pos: { page: number; ratio: number }) { syncFrom('right', pos) }
+
+function fromLeft(n: number) { leftPage.value = n }
+function fromRight(n: number) { rightPage.value = n }
 
 function zoomIn() { zoom.value = Math.min(3, Math.round((zoom.value + 0.1) * 10) / 10) }
 function zoomOut() { zoom.value = Math.max(0.4, Math.round((zoom.value - 0.1) * 10) / 10) }
@@ -89,7 +97,7 @@ watch(() => props.reloadKey, () => {
       <el-divider direction="vertical" />
       <el-switch v-model="syncEnabled" size="small" active-text="同步滚动" />
       <span style="flex:1" />
-      <span class="muted" style="color:#cfd4dc">
+      <span class="muted" style="color: var(--r-muted, #cfd4dc)">
         第 {{ displayPage }} 页 / 原文 {{ leftTotal }} 页 · 已译 {{ pagesDone }} 页
       </span>
     </div>
@@ -102,6 +110,7 @@ watch(() => props.reloadKey, () => {
         :url="originalUrl"
         :zoom="zoom"
         @page-change="fromLeft"
+        @scroll-pos="fromLeftScroll"
         @loaded="(n: number) => (leftTotal = n)"
       />
       <PdfPane
@@ -111,6 +120,7 @@ watch(() => props.reloadKey, () => {
         :zoom="zoom"
         :expected-total="expectedTotal"
         @page-change="fromRight"
+        @scroll-pos="fromRightScroll"
         @loaded="onRightLoaded"
       />
     </div>
@@ -130,9 +140,11 @@ watch(() => props.reloadKey, () => {
   align-items: center;
   gap: 10px;
   padding: 0 14px;
-  background: #2b2f33;
-  color: #e5e7eb;
+  background: var(--r-panel, #2b2f33);
+  color: var(--r-text, #e5e7eb);
+  border-bottom: 1px solid var(--r-border, transparent);
   flex-shrink: 0;
+  transition: background .25s;
 }
 .zoom-label {
   font-size: 12px;

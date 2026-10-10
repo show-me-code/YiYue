@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 复刻幻觉翻译核心体验的本地 Web 应用：上传 PDF → 用户自己的 OpenAI 兼容 API 翻译（BabelDOC 引擎，保持版式）→ 浏览器双栏对照阅读，支持术语表、缓存、批量队列、"翻完即读"。
+**Goal:** 本地 PDF 翻译 Web 应用：上传 PDF → 用户自己的 OpenAI 兼容 API 翻译（BabelDOC 引擎，保持版式）→ 浏览器双栏对照阅读，支持术语表、缓存、批量队列、"翻完即读"。
 
 **Architecture:** FastAPI 单进程后端嵌入 BabelDOC（`async_translate` 异步事件流），SQLite 存配置/任务/术语；Vue 3 + pdf.js 前端通过 REST + SSE 交互；任务编排器串行执行队列、按段切分大文件实现增量输出。
 
